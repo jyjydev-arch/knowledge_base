@@ -55,3 +55,11 @@ class ConflictError(BusinessError):
 
     def __init__(self, msg: str = "数据冲突", data=None) -> None:
         super().__init__(msg=msg, status=409, data=data)
+
+
+
+class NotImplementedFeatureError(BusinessError):
+    """功能尚未实现（占位接口），返回 501，前端能拿到明确的「还没做」提示"""
+
+    def __init__(self, msg: str = "该接口尚未实现", data=None) -> None:
+        super().__init__(msg=msg, status=501, data=data)

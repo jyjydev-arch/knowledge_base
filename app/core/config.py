@@ -43,7 +43,8 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     # 单位：分钟，默认 1 天
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
-    # 逗号分隔，用于 /user/list 这类管理接口（后续换成 role 字段后删掉）
+    # 引导用：注册时命中这里列出的用户名，users.role 直接给 admin
+    # （库里已有 role 字段，权限判断一律看 role，这个配置只负责「第一个管理员从哪来」）
     ADMIN_USERNAMES: str = "admin"
 
     # ---------------- 跨域 ----------------
@@ -66,6 +67,10 @@ class Settings(BaseSettings):
         if not self.SECRET_KEY or not self.SECRET_KEY.strip():
             self.SECRET_KEY = DEFAULT_SECRET_KEY
         return self
+
+    @property
+    def admin_usernames(self) -> set[str]:
+        return {name.strip() for name in self.ADMIN_USERNAMES.split(",") if name.strip()}
 
     @property
     def cors_origin_list(self) -> list[str]:

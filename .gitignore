@@ -221,6 +221,13 @@ __marimo__/
 
 .env
 .vscode/
-mode_modules/
 .venv/
 
+
+# ===== 本项目补充 =====
+# 本地数据（上传文件、索引、缓存）不入库
+/data/
+/logs/
+*.log
+# 修正原有拼写错误的规则
+node_modules/

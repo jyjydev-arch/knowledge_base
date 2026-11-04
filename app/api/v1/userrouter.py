@@ -11,16 +11,11 @@
 from datetime import timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 
-from app.api.deps import DB, AdminUser, CurrentToken, CurrentUser, ensure_ownership
+from app.api.deps import DB, AdminUser, CurrentToken, CurrentUser
 from app.core.config import settings
-from app.core.exceptions import (
-    ConflictError,
-    NotFoundError,
-    ParamError,
-    UnauthorizedError,
-)
+from app.core.exceptions import ConflictError, ParamError, UnauthorizedError
 from app.core.security import (
     create_access_token,
     get_password_hash,
@@ -28,6 +23,7 @@ from app.core.security import (
     verify_password,
 )
 from app.db.crud import token_crud, user_crud
+from app.db.models import UserRole
 from app.schemas.common import ApiResponse, PageData, PageParams
 from app.schemas.user_schemas import (
     AccountDelete,
@@ -41,7 +37,7 @@ from app.schemas.user_schemas import (
 
 router = APIRouter(
     prefix="/user",
-    tags=["用户"],
+    tags=["users"],
 )
 
 
@@ -51,13 +47,18 @@ router = APIRouter(
     summary="用户注册",
 )
 async def register_user(payload: UserCreate, db: DB):
-    """注册新用户：用户名、邮箱都唯一，密码只存 bcrypt 哈希"""
+    """注册新用户：用户名、邮箱都唯一，密码只存 bcrypt 哈希
+
+    权限引导：用户名命中 .env 的 ADMIN_USERNAMES 时 role 直接给 admin，
+    这样第一个管理员不用手工改库；之后的权限判断一律看 users.role。
+    """
     if await user_crud.is_username_taken(payload.username, db):
         raise ConflictError(f"用户名 {payload.username} 已被注册")
     if await user_crud.is_email_taken(payload.email, db):
         raise ConflictError("该邮箱已被注册")
 
-    user = await user_crud.create_user(payload, get_password_hash(payload.password), db)
+    role = UserRole.ADMIN if payload.username in settings.admin_usernames else UserRole.USER
+    user = await user_crud.create_user(payload, get_password_hash(payload.password), db, role=role)
     if user is None:  # 并发注册撞了唯一索引
         raise ConflictError("用户名或邮箱已被注册，请更换后重试")
 
@@ -65,7 +66,7 @@ async def register_user(payload: UserCreate, db: DB):
 
 
 @router.post("/login", response_model=ApiResponse[TokenResponse], summary="用户登录")
-async def login_user(payload: UserLogin, db: DB):
+async def login_user(payload: UserLogin, request: Request, db: DB):
     """登录：account 支持用户名或邮箱，成功后签发 JWT 并落库（便于退出登录）"""
     user = await user_crud.get_user_by_account(payload.account, db)
     # 用户不存在和密码错误返回同一个提示，避免暴露账号是否存在
@@ -74,7 +75,16 @@ async def login_user(payload: UserLogin, db: DB):
 
     expires_delta = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     token = create_access_token(user.id, expires_delta)
-    await token_crud.save_token(token, user.id, token_expire_datetime(expires_delta), db)
+    client_ip = request.client.host if request.client else None
+    await token_crud.save_token(
+        token,
+        user.id,
+        token_expire_datetime(expires_delta),
+        db,
+        client_ip=client_ip,
+        user_agent=request.headers.get("user-agent"),
+    )
+    await user_crud.touch_last_login(user, db)
 
     data = TokenResponse(
         access_token=token,
@@ -86,21 +96,14 @@ async def login_user(payload: UserLogin, db: DB):
 
 
 @router.get("/info", response_model=ApiResponse[UserResponse], summary="获取用户信息")
-async def get_user_info(
-    current_user: CurrentUser,
-    db: DB,
-    user_id: Annotated[str | None, Query(description="要查询的用户ID，不传默认查自己")] = None,
-):
-    """查询用户信息：不传 user_id 就查当前登录用户，传了只能查自己"""
-    if user_id is None:
-        return ApiResponse.ok(UserResponse.model_validate(current_user), msg="获取成功")
+async def get_user_info(current_user: CurrentUser):
+    """查询当前登录用户的信息
 
-    await ensure_ownership(current_user, user_id)
-    target = await user_crud.get_user_by_id(user_id, db)
-    if target is None:
-        raise NotFoundError("用户不存在")
-
-    return ApiResponse.ok(UserResponse.model_validate(target), msg="获取成功")
+    用户身份完全由 get_current_user 从 Authorization 头解析出来，
+    所以这里不需要（也不接受）user_id 参数 —— 传了也只会返回自己的信息，
+    避免变成越权入口。查别人请走管理员接口 GET /user/list。
+    """
+    return ApiResponse.ok(UserResponse.model_validate(current_user), msg="获取成功")
 
 
 @router.post("/logout", response_model=ApiResponse[None], summary="退出登录")

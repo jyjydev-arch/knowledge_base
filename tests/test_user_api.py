@@ -99,20 +99,15 @@ def test_info_returns_current_user(client, user_headers):
     assert body["data"]["username"] == "zhangsan"
 
 
-def test_info_cannot_read_others(client, user_headers, register, login):
+def test_info_ignores_user_id_param(client, user_headers, register, login):
+    """身份只来自 token：传别人的 user_id 也只会返回自己的信息（不再是个越权入口）"""
     register(username="lisi", email="lisi@example.com")
     other_id = login("lisi").json()["data"]["user"]["id"]
-    body = assert_envelope(
-        client.get(f"/api/v1/user/info?user_id={other_id}", headers=user_headers), 403
-    )
-    assert "权限" in body["msg"]
 
-
-def test_info_bad_user_id(client, user_headers):
     body = assert_envelope(
-        client.get("/api/v1/user/info?user_id=123", headers=user_headers), 403
+        client.get(f"/api/v1/user/info?user_id={other_id}", headers=user_headers), 200
     )
-    assert body["status"] == 403
+    assert body["data"]["username"] == "zhangsan"
 
 
 # ---------------- 修改资料 ----------------
@@ -238,3 +233,52 @@ def test_health_and_docs(client):
     # 统一响应模型进了 OpenAPI，前端可以直接生成 TS 类型
     ref = schema["paths"]["/api/v1/user/info"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
     assert "$ref" in str(ref) or "ApiResponse" in str(schema["components"]["schemas"])
+
+
+# ---------------- 新表字段：role / is_active / last_login_at ----------------
+def test_register_role_bootstrap(register, client):
+    """普通注册是 user；用户名命中 ADMIN_USERNAMES 时注册即 admin（第一个管理员的引导）"""
+    first = register().json()["data"]
+    assert first["role"] == "user"
+    assert first["is_active"] is True
+
+    resp = client.post(
+        "/api/v1/user/register",
+        json={"username": "admin", "email": "admin@example.com", "password": "abc123456"},
+    )
+    assert resp.json()["data"]["role"] == "admin"
+
+
+def test_login_records_last_login(client, user_headers):
+    """登录成功要刷新 last_login_at（tokens 表里也能看到来源 ip/UA）"""
+    body = assert_envelope(client.get("/api/v1/user/info", headers=user_headers), 200)
+    assert body["data"]["last_login_at"]
+
+
+def test_disabled_user_is_forbidden(client, user_headers, run):
+    """is_active=false 的账号：带着仍然合法的 token 也要被挡住（403）"""
+    from sqlalchemy import update
+
+    from app.db.models import User
+
+    async def _disable(session):
+        await session.execute(update(User).where(User.username == "zhangsan").values(is_active=False))
+        await session.commit()
+
+    run(_disable)
+    body = assert_envelope(client.get("/api/v1/user/info", headers=user_headers), 403)
+    assert "禁用" in body["msg"]
+
+
+def test_login_token_is_hashed_in_db(client, user_headers, run):
+    """库里的登录凭证只存 sha256，不存 JWT 原文"""
+    from sqlalchemy import select
+
+    from app.db.models import Token
+
+    rows = run(lambda session: session.execute(select(Token)))
+    tokens = rows.scalars().all()
+    assert tokens, "登录应该留下一条 token 记录"
+    for record in tokens:
+        assert len(record.token_hash) == 64 and "." not in record.token_hash
+        assert record.user_agent is not None or record.client_ip is not None

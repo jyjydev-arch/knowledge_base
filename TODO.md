@@ -1,0 +1,139 @@
+# 待实现清单（TODO / Gap Analysis）
+
+> 更新时间：2026-11-04（表结构已重做）。配套规范见 [DEVELOPMENT.md](DEVELOPMENT.md)。
+
+## 0. 进度快照
+
+| 模块 | 状态 | 代码位置 |
+| --- | --- | --- |
+| 用户系统（注册/登录/登出/资料/改密/注销/管理列表） | ✅ 已实现（48 条测试全绿） | `app/api/v1/userrouter.py`、`app/db/crud/user_crud.py` |
+| 统一返回格式 + 全局异常包装 | ✅ 已实现 | `app/schemas/common.py`、`app/main.py` |
+| JWT 鉴权 + token 落库（可吊销） | ✅ 已实现 | `app/api/deps.py`、`app/db/crud/token_crud.py` |
+| 文档模块骨架 | 🚧 已有 `documentrouter.py`（6 条路由）+ `document_crud.py`；`GET /documents/list` 已接通并加了分页/越权/序列化，其余 5 条返回 501 | `app/api/v1/documentrouter.py` |
+| 解析 / 切块（M2） | ❌ 0 实现 | `app/services/process_document.py` 目前只有 `import os` |
+| 语义检索 / RAG 问答 | ❌ 0 实现 | 待建 `app/api/v1/searchrouter.py`、`chatrouter.py`；`chat_history` 表按要求后面再建 |
+| 向量库 | ⏸️ **按要求先不做**：chunks 没有 embedding 列，`init_db.sql` 里的 `CREATE EXTENSION vector` 已注释（本机 PG17 也没装 pgvector） | `app/db/models.py` |
+| 数据库迁移 | ⚠️ 无 alembic；已改为「ORM 单一真源」+ `scripts/init_db.py`（建表/重置/检查/生成 SQL 快照） | `scripts/init_db.py` |
+| 后台任务（解析/向量化是慢活） | ❌ 无 | — |
+| 日志 / 限流 / 监控 / Docker / CI | ❌ 无 | — |
+
+**一句话：账号系统 + 5 张业务表已经就位，文档只通了「列表」这一条；解析→入库→检索→问答还没动。**
+
+---
+
+## 1. P0：跑通知识库主线（RAG 闭环）
+
+> 建议按里程碑自上而下做，每个里程碑都能单独验收。
+
+### M0 知识库（knowledge_bases）接口（约 0.5 天，先做这个）
+
+`documents.kb_id` 是 NOT NULL，所以没有知识库接口就传不进文档 —— 这是当前最卡脖子的一环。
+
+- [ ] `app/api/v1/kbrouter.py`：`POST /kb`（建库）、`GET /kb/list`、`GET /kb/detail?kb_id=`、`POST /kb/update`（改 name/description/chunk 配置）、`DELETE /kb/{kb_id}`（软删 + 级联清理）
+- [ ] `app/schemas/kb_schemas.py`：`KbCreate(name, description, visibility?, chunk_size?, chunk_overlap?)` / `KbOut`（含 document_count、chunk_count、**version**、last_indexed_at）
+- [ ] `app/db/crud/kb_crud.py`：查询一律带 `owner_id`；`refresh_kb_stats` 已在 `document_crud` 里，直接复用
+- [ ] `documentrouter` 的 upload/detail/status 接收 `kb_id` 参数（不传则用用户的默认库：`is_default` 或最早创建的那个）
+- 验收：建库 → 看到 version=1 → 建文档 → version=2、document_count=1（`test_create_document_bumps_kb_version` 已覆盖 CRUD 层）
+
+### M1 文档上传与元数据（约 1 天）
+- 路由骨架已有：`POST /documents/upload`（multipart，需 `kb_id`）、`/list` ✅、`/detail`、`DELETE /delete/{id}`、`/status`、`/download/{id}`
+- 文件落地沿用你的约定 `data/{user_id}/documents/{document_id}.{ext}`，库里只存相对路径 `documents.file_path`（`.gitignore` 已忽略 `/data/`）
+- 校验：类型白名单（pdf/docx/md/txt）、大小上限（默认 20MB，超限 `raise BusinessError(status=413)`）、文件名 sanitize
+- `Document.status` 流转：`pending → parsing → chunking → indexed / failed`（+ `error_msg`）
+- ~~补 documents 缺失列~~ ✅ 表已重做：title/file_path/file_size/mime_type/file_hash/status/error_msg/chunk_count/token_count/updated_at/deleted_at 都在，CRUD 也齐了（`create_document` 会自动 `refresh_kb_stats` 更新知识库版本）
+- 验收：上传→查列表→查状态→删除→级联文件被清理；owner 隔离（A 不能看/删 B 的文档，`document_crud` 每个查询都带 `owner_id`）
+
+### M2 解析 + 切块（约 1–2 天）
+- 落点在已有的 `app/services/`：`process_document.py`（编排：读文件→解析→切块→写库）+ `parsers/`（`base.py` 协议 + `pdf.py`/`docx.py`/`markdown.py`/`text.py`，按扩展名工厂选择）
+- 新依赖：`pypdf`、`python-docx`、（可选）`unstructured`；统一输出纯文本 + 页码/章节，写进 `chunks.page/heading/extra`
+- `app/services/chunker.py`：按段落/标题边界 + `chunk_size`(默认 500–800 token) + `overlap`(10–15%)；纯函数，先写单测再写库
+- ~~新表 chunks~~ ✅ 已建好（`id/document_id/kb_id/owner_id/seq/content/token_count/page/heading/extra`），只差 `embedding vector(N)` 列 + HNSW 索引
+- 验收：同一篇文档重复入库结果幂等（先删旧 chunk 再插），中文与英文样本都能切出合理块
+
+### M3 向量化入库（约 1–2 天）⏸️ 当前明确先不做
+
+> 你已确认 pgvector / 向量化这块先不处理，下面整段是到时候的备忘，不是本轮任务。
+> 另外提醒：本机 PostgreSQL 17 **没装 pgvector 扩展**（`/usr/share/postgresql/17/extension/` 里没有 vector.control），
+> 所以现在跑 `CREATE EXTENSION vector` 会直接报错；到 M3 需要先 `apt install postgresql-17-pgvector` 或改用 Docker 的 pgvector 镜像。
+- `app/services/embedding.py`：接口 `async def embed(texts: list[str]) -> list[list[float]]`
+  - 方案 A 本地：`sentence-transformers`（bge-m3 / text2vec-large-chinese，维度 768/1024，需要 torch，首次拉模型较大）
+  - 方案 B API：OpenAI 兼容 `/v1/embeddings`（`text-embedding-3-small` 1532 维）走 `httpx`，配 `EMBEDDING_BASE_URL/API_KEY/MODEL/DIMS`
+  - **维度必须写进配置**，`vector(?)` 建列和检索都依赖它，改了要重建表
+- `init_db.sql` 补：`CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops)`；确认 PG 装了 pgvector ≥0.5
+- 入库流程：解析→切块→批量 embedding→`INSERT chunks`→更新 `documents.status/indexed`
+- 验收：一篇 10 页 PDF 全链路进库，`SELECT count(*) FROM chunks` 有数据，向量非空
+
+### M4 检索（约 1 天）
+- `app/services/retriever.py`：`search_embedding(vec, user_id, top_k)`，SQL 用 `<=>` 余弦距离 + `WHERE user_id = :uid`
+- `POST /search`：`{query, top_k, min_score, document_ids?}` → `{status,msg,data:{items:[{chunk_id,document_id,content,score,...}]}}`
+- 进阶：pgvector + PG 全文（`tsvector`）混合检索，再 `rerank`（bge-reranker 或 LLM rerank）；查询文本要先 embedding
+- ⚠️ 越权是这类系统最常见的洞：**任何检索都必须带 `user_id` 过滤**，并把"跨用户检索"写成一条测试
+- 验收：问一句能召回正确段落；B 用户搜不到 A 用户内容
+
+### M5 问答（RAG）+ 会话（约 2 天）
+- `app/services/llm.py`：`chat(messages)` 抽象，支持流式；配置 `LLM_BASE_URL/API_KEY/MODEL`
+- `POST /chat`（或 `/qa`）：检索 top-k → prompt 模板（含引用编号、"资料里没有就回答不知道"）→ 调 LLM → 回传 `references`
+- 流式：SSE `text/event-stream`；注意流式接口不能套 `ApiResponse` 外层，需单独约定（见 DEVELOPMENT.md 第 3.6 节）
+- 新表 `chat_sessions` / `chat_messages`（存问题、答案、引用的 chunk_id 列表）
+- 验收：多轮对话带上下文、答案带可点击来源、无检索结果时不瞎编
+
+### M6 慢任务异步化（约 1 天）
+- 解析+向量化很耗时：先用 FastAPI `BackgroundTasks`（最简）→ 量大再换 `arq`/`celery` + Redis
+- 要求：接口立刻返回 `document_id` + `status=pending`，前端轮询 `GET /document/status`；失败可 `POST /document/{id}/reindex` 重试且幂等
+
+---
+
+## 2. P1：用户/安全收尾
+
+已完成（本轮顺手收掉）：`users.role` 权限、`is_active` 禁用拦截（403）、`last_login_at`、
+`tokens` 改存 sha256 + 记录 ip/UA、`get_optional_user` 补上 token 吊销校验、`/user/info` 去掉 `user_id` 参数。
+
+- [ ] **真正的"忘记密码"**：现在 `reset_password` 要求已登录，用户忘了密码就没路 → 邮箱验证码/重置链接（需 SMTP 配置 + `password_reset_tokens` 表）
+- [ ] **refresh token**：现在 24h 过期就要重登；加 `POST /user/refresh`（或双 token）
+- [ ] **登录防护**：失败次数锁定 + 限流（`slowapi` 或自写 Redis 计数）；防用户名枚举（现有提示已统一，但注册接口仍会暴露"邮箱已被注册"，按需收敛）
+- [ ] **密码策略**：至少含数字+字母/强弱提示、常见弱密码黑名单；`data/` 里别留明文
+- [x] ~~role 字段~~ ✅ 已做：`users.role` + `User.is_admin`，`require_admin_dep` 只看 role；`ADMIN_USERNAMES` 降级为「第一个管理员从哪来」的注册引导
+- [ ] **软删除 + 恢复**：`users.deleted_at`、`documents.deleted_at`，注销给冷静期
+- [ ] **审计**：敏感操作（改密/注销/管理员列表）写日志
+- [ ] 修小坑：`get_optional_user` 没查 token 表（吊销后仍视为已登录）；`token.token` 列 `VARCHAR(255)` 对 JWT 偏紧（实测 ~200 字符，再加 `jti` 就溢出）→ 扩到 512 或只存哈希
+
+## 3. P1：工程化
+
+- [ ] **alembic 迁移**：取代手写 `init_db.sql`（当前 ORM 与 SQL 两份定义已经开始漂移：`documents` 缺 `title/file_path/...`）
+- [ ] **日志**：结构化（`loguru` 或 `logging` + JSON formatter）、请求 ID、SQL 只在 `SQL_ECHO` 开；错误日志不能包含密码/token
+- [ ] **测试**：M1–M5 每个里程碑配接口测试；服务层（chunker/retriever/prompt）做纯单测；给 embeddings/LLM 做假实现（`fixture` 注入）以免跑测试烧钱
+- [ ] **Docker**：`docker-compose.yml`（pgvector 镜像 `pgvector/pgvector:pg17` + api + worker + redis），数据卷持久化
+- [ ] **CI**：GitHub Actions 跑 `pytest` + `ruff check`（本地 `.venv` 没有 pip，装包用 `uv`）
+- [ ] **脚本**：`scripts/`（当前空目录）放 `init_db.py`、`reindex.py`、`backup.sh`、`create_admin.py`
+- [ ] **配置**：`.env` 现在只有空的 `PSQL_URL` → 至少填 `DATABASE_URL`、`SECRET_KEY`（生产随机）、`EMBEDDING_*`、`LLM_*`
+- [ ] 文档：接口示例、错误码表、部署步骤（README 已有骨架）
+
+## 4. P2：锦上添花
+
+- 混合检索 BM25/tsvector、查询改写（HyDE）、rerank、分块策略可配置、图片 OCR、表格结构化
+- 知识库分享（链接/团队空间）、标签与目录树、批量导入、去重（文件 hash）
+- 引用高亮与段落定位、答案流式截断保护、token 计费统计
+- 前端（本轮不弄）：`frontend/` 还是 vite 初始模板，需要 axios/fetch 封装（按 `{status,msg,data}` 解包）、路由守卫、上传进度、对话页
+
+## 5. 表结构现状与还缺的表
+
+已就位（`app/db/models.py`，建表走 `scripts/init_db.py`）：
+
+```
+users / tokens / knowledge_bases / documents / chunks     ← 5 张，owner_id 全链路冗余
+```
+
+还缺：
+
+```
+kb_shares            知识库分享（user_id + kb_id + permission(read/write)），P2 团队协作时建
+password_reset_tokens 「忘记密码」验证码/重置链接，P1
+chat_sessions / chat_messages  会话与消息（含引用的 chunk_id 列表），P0-M5，你说了后面再建
+chunks.embedding     vector(N) + HNSW 索引，P0-M3，pgvector 方案定了再加（当前不做）
+```
+
+## 6. 建议顺序（一周内可完成的版本）
+
+`M1 上传 → M2 解析切块 → M3 向量化 → M4 检索 → 安全收尾(越权测试 + 忘记密码) → M5 问答 → M6 异步 → Docker/CI`
+
+每完成一个里程碑就：`app/.venv/bin/python -m pytest` 全绿 + 更新本文件勾选框 + 一次 commit。

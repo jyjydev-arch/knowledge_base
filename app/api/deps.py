@@ -6,7 +6,6 @@ from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.core.exceptions import ForbiddenError, UnauthorizedError
 from app.core.security import decode_access_token
 from app.db.crud import token_crud, user_crud
@@ -37,8 +36,10 @@ async def get_current_user(
         raise UnauthorizedError("登录凭证无效或已过期，请重新登录")
 
     user = await user_crud.get_user_by_id(payload["sub"], db)
-    if user is None:
-        raise UnauthorizedError("账号不存在或已被删除，请重新登录")
+    if user is None or user.deleted_at is not None:
+        raise UnauthorizedError("账号不存在或已注销，请重新登录")
+    if not user.is_active:
+        raise ForbiddenError("账号已被禁用，请联系管理员")
 
     if not await token_crud.is_token_active(token, db):
         raise UnauthorizedError("登录已失效（已登出或被踢下线），请重新登录")
@@ -68,25 +69,21 @@ async def get_optional_user(
         raise UnauthorizedError("登录凭证无效或已过期，请重新登录")
 
     user = await user_crud.get_user_by_id(payload["sub"], db)
-    if user is None:
-        raise UnauthorizedError("账号不存在或已被删除，请重新登录")
-    return user
-
-
-async def ensure_ownership(user: User, target_user_id) -> User:
-    """校验目标用户是不是自己（后续加角色/权限时只改这里）"""
-    if str(user.id) != str(target_user_id):
-        raise ForbiddenError("没有权限操作其他用户的数据")
+    if user is None or user.deleted_at is not None or not user.is_active:
+        return None
+    # 之前漏了这一步：已吊销的 token 不该再算登录
+    if not await token_crud.is_token_active(credentials.credentials, db):
+        return None
     return user
 
 
 async def require_admin_dep(user: User = Depends(get_current_user)) -> User:
-    """简易权限控制：只有 .env 里 ADMIN_USERNAMES 列出的用户名可以调用
+    """管理员校验：直接看 users.role
 
-    后续给 users 表加了 role 字段之后，把这里换成基于角色的校验即可。
+    第一个管理员从哪来：注册时用户名命中 settings.ADMIN_USERNAMES 就写 role=admin，
+    之后正常权限都走 role 字段，不再依赖配置。
     """
-    admins = {name.strip() for name in settings.ADMIN_USERNAMES.split(",") if name.strip()}
-    if user.username not in admins:
+    if not user.is_admin:
         raise ForbiddenError("需要管理员权限")
     return user
 

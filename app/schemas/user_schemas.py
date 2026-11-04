@@ -5,6 +5,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
+from app.db.models import UserRole
+
 # 用户名: 3~50 位，允许中英文、数字、下划线、中划线
 USERNAME_PATTERN = r"^[A-Za-z0-9_\u4e00-\u9fa5][A-Za-z0-9_\-\u4e00-\u9fa5]{2,49}$"
 # bcrypt 只使用密码的前 72 个字节，这里直接限制长度，避免注册后被静默截断
@@ -103,7 +105,10 @@ class UserResponse(UserBase):
     """返回给前端的用户信息（绝不会带 hashed_password）"""
 
     id: uuid.UUID = Field(description="用户ID")
+    role: UserRole = Field(default=UserRole.USER, description="角色：user / admin")
+    is_active: bool = Field(default=True, description="是否可用（被禁用后无法登录）")
     created_at: datetime | None = Field(default=None, description="创建时间")
+    last_login_at: datetime | None = Field(default=None, description="最近登录时间")
 
     model_config = ConfigDict(from_attributes=True, str_strip_whitespace=True)
 
