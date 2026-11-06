@@ -207,7 +207,8 @@ class Document(Base, TimestampMixin, SoftDeleteMixin):
 
     title: Mapped[str] = mapped_column(String(255), nullable=False)     # 展示用
     filename: Mapped[str] = mapped_column(String(255), nullable=False)  # 用户上传时的原始名
-    # 相对路径，约定 data/{user_id}/documents/{document_id}.{ext}（沿用 documentrouter 里的说明）
+    # 存储路径约定（与 services/process_document.delete_document_file 一致）：
+    #   data/{user_id}/{kb_id}/{document_id}.{ext}    相对进程 CWD，start.sh 在项目根启动
     file_path: Mapped[str] = mapped_column(String(512), nullable=False)
     file_size: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"), nullable=False)
     mime_type: Mapped[str | None] = mapped_column(String(128), nullable=True)

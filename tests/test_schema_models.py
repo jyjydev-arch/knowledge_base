@@ -39,13 +39,16 @@ async def _add_doc(session, kb_id, owner_id, filename="a.md", file_hash=None, **
         owner_id=_u(owner_id),
         title=filename,
         filename=filename,
-        file_path=f"data/{owner_id}/documents/{filename}",
+        file_path="",  # 真实路径要用插入后才有值的 document_id 拼，见下面
         file_size=1024,
         mime_type="text/markdown",
         file_hash=file_hash or f"hash-{filename}",
         **kwargs,
     )
     session.add(doc)
+    await session.commit()
+    # 约定：data/{user_id}/{kb_id}/{document_id}.{ext}
+    doc.file_path = f"data/{owner_id}/{doc.kb_id}/{doc.id}.md"
     await session.commit()
     await session.refresh(doc)
     return doc

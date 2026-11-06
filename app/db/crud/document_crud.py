@@ -14,7 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import DocStatus, Document, KnowledgeBase
+from app.db.models import Chunk, DocStatus, Document, KnowledgeBase
 
 
 def _to_uuid(raw):
@@ -72,6 +72,22 @@ async def get_document(document_id, owner_id, db: AsyncSession) -> Document | No
     return result.scalar_one_or_none()
 
 
+async def get_knowledge_base(kb_id, owner_id, db: AsyncSession) -> KnowledgeBase | None:
+    """上传文档前必须先过这一关：知识库得存在、没被删、而且是当前用户自己的
+
+    少了这一步就能把文件塞进别人的知识库（kb_id 是客户端传进来的）。
+    """
+    pk, uid = _to_uuid(kb_id), _to_uuid(owner_id)
+    if pk is None or uid is None:
+        return None
+    result = await db.execute(
+        select(KnowledgeBase).where(
+            KnowledgeBase.id == pk, KnowledgeBase.owner_id == uid, KnowledgeBase.deleted_at.is_(None)
+        )
+    )
+    return result.scalar_one_or_none()
+
+
 async def get_document_by_hash(kb_id, file_hash: str, db: AsyncSession) -> Document | None:
     """上传判重：同一个知识库里同一个文件（sha256）不重复入库"""
     pk = _to_uuid(kb_id)
@@ -93,15 +109,22 @@ async def create_document(
     mime_type: str | None,
     file_hash: str,
     db: AsyncSession,
+    *,
+    document_id=None,
+    status: str = DocStatus.PENDING,
 ) -> Document | None:
     """新建文档记录，状态默认 pending（等解析/切块任务去推进）
 
     kb 不存在（外键失败）或同库同文件已存在（唯一索引冲突）都回滚并返回 None。
+
+    document_id 可以由调用方预先指定 —— 上传就是这种场景：
+    文件名要用 document_id 拼（data/{user_id}/{kb_id}/{document_id}.{ext}），所以必须先生成 id 再落盘。
     """
     if _to_uuid(kb_id) is None or _to_uuid(owner_id) is None:
         return None
 
     record = Document(
+        id=_to_uuid(document_id) or uuid_lib.uuid4(),
         kb_id=_to_uuid(kb_id),
         owner_id=_to_uuid(owner_id),
         title=title,
@@ -110,7 +133,7 @@ async def create_document(
         file_size=file_size,
         mime_type=mime_type,
         file_hash=file_hash,
-        status=DocStatus.PENDING,
+        status=status,
     )
     db.add(record)
     try:
@@ -178,6 +201,36 @@ async def count_by_status(owner_id, db: AsyncSession, kb_id=None) -> dict[str, i
     return counts
 
 
+async def list_document_paths(kb_id, owner_id, db: AsyncSession) -> list[str]:
+    """某个知识库下全部文档的存储路径（给 /status 做「磁盘 ↔ 数据库」核对）
+
+    不分页：核对必须看到全量，翻页会导致误判成文件缺失。
+    """
+    pk, uid = _to_uuid(kb_id), _to_uuid(owner_id)
+    if pk is None or uid is None:
+        return []
+    result = await db.execute(
+        select(Document.file_path)
+        .where(Document.kb_id == pk, Document.owner_id == uid, Document.deleted_at.is_(None))
+        .order_by(Document.created_at.desc())
+    )
+    return [row for row in result.scalars().all() if row]
+
+
+async def list_chunks(document_id, owner_id, db: AsyncSession, limit: int = 3) -> list[Chunk]:
+    """按 seq 升序取文档正文的前几块（详情预览用），同样带 owner_id"""
+    did, uid = _to_uuid(document_id), _to_uuid(owner_id)
+    if did is None or uid is None:
+        return []
+    result = await db.execute(
+        select(Chunk)
+        .where(Chunk.document_id == did, Chunk.owner_id == uid)
+        .order_by(Chunk.seq)
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
 async def refresh_kb_stats(kb_id, db: AsyncSession, *, bump_version: bool = True) -> KnowledgeBase | None:
     """重算知识库统计并把版本号 +1（文档增删/重索引后调用）
 
@@ -209,3 +262,10 @@ async def refresh_kb_stats(kb_id, db: AsyncSession, *, bump_version: bool = True
     await db.commit()
     await db.refresh(kb)
     return kb
+
+async def get_document_by_userid_and_kdid(
+    user_id: str,
+    kb_id: str,
+    db: AsyncSession
+)-> list[str]:
+    pass
