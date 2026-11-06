@@ -9,7 +9,7 @@
 | 用户系统（注册/登录/登出/资料/改密/注销/管理列表） | ✅ 已实现（48 条测试全绿） | `app/api/v1/userrouter.py`、`app/db/crud/user_crud.py` |
 | 统一返回格式 + 全局异常包装 | ✅ 已实现 | `app/schemas/common.py`、`app/main.py` |
 | JWT 鉴权 + token 落库（可吊销） | ✅ 已实现 | `app/api/deps.py`、`app/db/crud/token_crud.py` |
-| 文档模块骨架 | 🚧 已有 `documentrouter.py`（6 条路由）+ `document_crud.py`；`GET /documents/list` 已接通并加了分页/越权/序列化，其余 5 条返回 501 | `app/api/v1/documentrouter.py` |
+| 文档模块 | ✅ 6 条路由全部实现：`/list`、`/upload`、`/detail`、`/status`（磁盘↔数据库核对）、`DELETE /delete/{id}`、`/download/{id}` | `app/api/v1/documentrouter.py` |
 | 解析 / 切块（M2） | ❌ 0 实现 | `app/services/process_document.py` 目前只有 `import os` |
 | 语义检索 / RAG 问答 | ❌ 0 实现 | 待建 `app/api/v1/searchrouter.py`、`chatrouter.py`；`chat_history` 表按要求后面再建 |
 | 向量库 | ⏸️ **按要求先不做**：chunks 没有 embedding 列，`init_db.sql` 里的 `CREATE EXTENSION vector` 已注释（本机 PG17 也没装 pgvector） | `app/db/models.py` |
@@ -36,15 +36,24 @@
 - 验收：建库 → 看到 version=1 → 建文档 → version=2、document_count=1（`test_create_document_bumps_kb_version` 已覆盖 CRUD 层）
 
 ### M1 文档上传与元数据（约 1 天）
-- 路由骨架已有：`POST /documents/upload`（multipart，需 `kb_id`）、`/list` ✅、`/detail`、`DELETE /delete/{id}`、`/status`、`/download/{id}`
-- 文件落地沿用你的约定 `data/{user_id}/documents/{document_id}.{ext}`，库里只存相对路径 `documents.file_path`（`.gitignore` 已忽略 `/data/`）
+- ✅ M1 六条全部实现（含边界、判重、回滚、kb 版本联动、磁盘↔数据库一致性核对）
+- ⚠️ 但 **M0 知识库接口仍然没做**：前端现在拿不到 `kb_id`，只能靠手工往库里插数据；`/upload`、`/status` 都强依赖它
+- 依赖提醒：用了 `UploadFile`/`File(...)` 就必须装 `python-multipart`（已进 pyproject + requirements.txt），
+  缺它不是接口报错，而是 `import app.main` 直接失败、服务起不来
+- 文件落地按约定 **`data/{user_id}/{kb_id}/{document_id}.{ext}`**，库里 `documents.file_path` 存的就是这一串相对路径；按知识库分目录后 `/status` 才能直接 ls 整个目录做一致性核对；`.gitignore` 已忽略 `/data/`
+- 唯一来源 `process_document.document_storage_path(user_id, kb_id, document_id, ext)`；`new_document_file_path` / `delete_document_file` / `search_document_file` 三个函数都带 `kb_id` 参数（签名已改）
 - 校验：类型白名单（pdf/docx/md/txt）、大小上限（默认 20MB，超限 `raise BusinessError(status=413)`）、文件名 sanitize
 - `Document.status` 流转：`pending → parsing → chunking → indexed / failed`（+ `error_msg`）
 - ~~补 documents 缺失列~~ ✅ 表已重做：title/file_path/file_size/mime_type/file_hash/status/error_msg/chunk_count/token_count/updated_at/deleted_at 都在，CRUD 也齐了（`create_document` 会自动 `refresh_kb_stats` 更新知识库版本）
 - 验收：上传→查列表→查状态→删除→级联文件被清理；owner 隔离（A 不能看/删 B 的文档，`document_crud` 每个查询都带 `owner_id`）
+- ✅ 删除部分已完成并有 9 条测试覆盖（成功/文件不存在/目录穿越/路径不一致/越权 404/非 uuid 422/重复删 404/未登录 401/服务函数单测）
 
 ### M2 解析 + 切块（约 1–2 天）
-- 落点在已有的 `app/services/`：`process_document.py`（编排：读文件→解析→切块→写库）+ `parsers/`（`base.py` 协议 + `pdf.py`/`docx.py`/`markdown.py`/`text.py`，按扩展名工厂选择）
+- 落点在已有的 `app/services/`：`process_document.py`（编排：读文件→解析→切块→写库；删除逻辑 `delete_document_file` 已写好并被路由调用）+ `parsers/`（`base.py` 协议 + `pdf.py`/`docx.py`/`markdown.py`/`text.py`，按扩展名工厂选择）
+- ✅ 路径约定已定：`data/{user_id}/{kb_id}/{document_id}.{ext}`，文档/注释已全部对齐（没有多余的 `documents/` 一层）。
+- ✅ 上传实现时把路径拼法收敛成唯一来源：`process_document.document_storage_path(user_id, document_id, ext)`，
+  落盘（`new_document_file_path`）、删除（`delete_document_file`）、边界校验（`documentrouter._build_cleanup_target`）都用它
+- ⏸️ 仍先不做：`UPLOAD_ROOT` 不提配置（路径相对进程 CWD，靠 `start.sh` 在项目根启动）、上传大小限制仍是路由里的常量 20MB
 - 新依赖：`pypdf`、`python-docx`、（可选）`unstructured`；统一输出纯文本 + 页码/章节，写进 `chunks.page/heading/extra`
 - `app/services/chunker.py`：按段落/标题边界 + `chunk_size`(默认 500–800 token) + `overlap`(10–15%)；纯函数，先写单测再写库
 - ~~新表 chunks~~ ✅ 已建好（`id/document_id/kb_id/owner_id/seq/content/token_count/page/heading/extra`），只差 `embedding vector(N)` 列 + HNSW 索引
@@ -136,4 +145,4 @@ chunks.embedding     vector(N) + HNSW 索引，P0-M3，pgvector 方案定了再�
 
 `M1 上传 → M2 解析切块 → M3 向量化 → M4 检索 → 安全收尾(越权测试 + 忘记密码) → M5 问答 → M6 异步 → Docker/CI`
 
-每完成一个里程碑就：`app/.venv/bin/python -m pytest` 全绿 + 更新本文件勾选框 + 一次 commit。
+每完成一个里程碑就：`.venv/bin/python -m pytest` 全绿 + 更新本文件勾选框 + 一次 commit。

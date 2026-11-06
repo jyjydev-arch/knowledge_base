@@ -8,29 +8,37 @@
 ## 目录结构
 
 ```
-app/
-├── main.py                 # FastAPI 入口 + 统一返回格式的异常处理器
-├── api/
-│   ├── deps.py             # 公共依赖：DB Session、当前登录用户、管理员校验
-│   └── v1/
-│       └── userrouter.py   # 用户路由（main.py 里 include_router 挂载）
-├── core/
-│   ├── config.py           # .env 配置
-│   ├── security.py         # 密码哈希 + JWT 签发/解析
-│   └── exceptions.py       # 业务异常（会被统一包成 status/msg/data）
-├── db/
-│   ├── base.py             # DeclarativeBase
-│   ├── models.py           # SQLAlchemy 模型：User / Token / KnowledgeBase / Document / Chunk
-│   ├── psql_config.py      # 异步引擎、Session、get_db 依赖
-│   └── crud/               # 数据访问层：user_crud / token_crud / document_crud（只读写库，不抛 HTTP 异常）
-├── services/               # 业务算法层（解析/切块/向量化/检索/prompt），M2 起用
-└── schemas/
-    ├── common.py           # ApiResponse[T] / PageData[T] / PageParams
-    ├── user_schemas.py     # 用户相关请求体与响应体
-    └── document_schemas.py # 文档相关响应体（含 download_url）
-
-scripts/
-└── init_db.py              # 建表 / 重置 / 检查 / 生成 init_db.sql
+.                               # 项目根 = Python 导入根（所以一律 from app.xxx import ...）
+├── pyproject.toml              # uv 项目定义 + pytest / ruff 配置
+├── uv.lock                     # 完整锁定文件
+├── .venv/                      # 虚拟环境（根目录，已 gitignore）
+├── requirements*.txt           # 给 pip 用户的等价清单
+├── init_db.sql                 # 由 models.py 生成的 PG 建表快照（勿手改）
+├── start.sh                    # 启动脚本（uvicorn app.main:app --reload）
+├── scripts/
+│   └── init_db.py              # 建表 / --drop 重置 / --check / --snapshot 生成 SQL
+├── tests/                      # 接口测试 + 表结构测试
+├── frontend/                   # Vue 前端（暂未接管）
+├── data/                       # 上传的原始文件（gitignore）
+└── app/                        # 后端代码包
+    ├── main.py                 # FastAPI 入口 + 统一返回格式的异常处理器
+    ├── api/
+    │   ├── deps.py             # 公共依赖：DB Session、当前登录用户、管理员校验
+    │   └── v1/
+    │       ├── userrouter.py   # 用户路由
+    │       └── documentrouter.py  # 文档路由
+    ├── core/
+    │   ├── config.py           # .env 配置
+    │   ├── security.py         # 密码哈希 + JWT 签发/解析
+    │   ├── document_hash.py    # 上传文件的流式 sha256 + 体积上限
+    │   └── exceptions.py       # 业务异常（统一包成 status/msg/data）
+    ├── db/
+    │   ├── base.py             # DeclarativeBase
+    │   ├── models.py           # 表结构唯一真源：User / Token / KnowledgeBase / Document / Chunk
+    │   ├── psql_config.py      # 异步引擎、Session、get_db 依赖
+    │   └── crud/               # 数据访问层（只读写库，不抛 HTTP 异常）
+    ├── services/               # 业务算法层：存储路径/落盘/删除，M2 起加解析切块
+    └── schemas/                # ApiResponse[T] / PageData[T] / 各模块请求响应体
 ```
 
 > 包里没有 `__init__.py`，靠 Python 3.3+ 的命名空间包（PEP 420）导入，少一层维护成本。
@@ -38,17 +46,17 @@ scripts/
 ## 快速开始
 
 ```bash
-# 1. 装依赖（虚拟环境在 app/.venv）
-cd app && ~/.local/bin/uv sync --group dev && cd ..
-#    不想用 uv 的话: python -m venv app/.venv && app/.venv/bin/pip install -r requirements-dev.txt
+# 1. 装依赖（在项目根执行，虚拟环境 = 根目录 .venv）
+~/.local/bin/uv sync --group dev
+#    不想用 uv 的话: python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
 # 2. 配置 .env（可直接复制 .env.example，至少要填 DATABASE_URL 和 SECRET_KEY）
 cp .env.example .env
 
 # 3. 建表（表结构真源是 app/db/models.py，按 .env 里的 DATABASE_URL 执行）
-app/.venv/bin/python scripts/init_db.py            # 只建缺失的表
-app/.venv/bin/python scripts/init_db.py --check    # 检查库里的表和模型是否一致
-app/.venv/bin/python scripts/init_db.py --drop     # 开发期重置：删表重建（会清空数据）
+.venv/bin/python scripts/init_db.py            # 只建缺失的表
+.venv/bin/python scripts/init_db.py --check    # 检查库里的表和模型是否一致
+.venv/bin/python scripts/init_db.py --drop     # 开发期重置：删表重建（会清空数据）
 #    init_db.sql 是同一份结构生成的 PostgreSQL 快照，可用 --snapshot > init_db.sql 刷新
 
 # 4. 启动
@@ -101,14 +109,29 @@ app/.venv/bin/python scripts/init_db.py --drop     # 开发期重置：删表重
 | 方法 | 路径 | 说明 | 状态 |
 | --- | --- | --- | --- |
 | GET | `/list` | 分页列出自己的文档（可按 `kb_id` 过滤），带 `download_url` | ✅ 已实现 |
-| POST | `/upload` | 上传文件、入库并更新知识库版本信息 | 🚧 501 |
-| GET | `/detail` | 文档正文预览 + 所属知识库版本信息 | 🚧 501 |
-| GET | `/status` | 各解析状态的文档数量 | 🚧 501 |
-| DELETE | `/delete/{document_id}` | 删除文档并同步知识库统计/版本 | 🚧 501 |
-| GET | `/download/{document_id}` | 下载原始文件 | 🚧 501 |
+| POST | `/upload` | 上传文档：类型/大小/kb 归属边界 → sha256 判重 → 落盘 → 写库（失败回滚），返回 `DocumentResponse` | ✅ 已实现 |
+| GET | `/detail` | 文档详情：正文预览（按 chunk seq 升序）+ `kb_name`/`kb_version`/`chunk_total` | ✅ 已实现 |
+| GET | `/status` | 知识库状态：五种解析进度 + **磁盘↔数据库一致性核对**（`missing_files`/`orphan_files`/`healthy`） | ✅ 已实现 |
+| DELETE | `/delete/{document_id}` | 先判边界 → 删记录（级联删块、知识库 version+1）→ 再删磁盘文件 | ✅ 已实现 |
+| GET | `/download/{document_id}` | 下载原始文件（`FileResponse`，用 `filename` 原始名，路径越界一律拒绝） | ✅ 已实现 |
 
-未实现的接口统一返回 `{"status": 501, "msg": "...还没实现（见 TODO.md P0-M1）", "data": null}`，
-不会静默返回 null 骗过前端。
+文档 6 条路由已全部实现（`NotImplementedFeatureError` → 501 保留给以后新增接口占位用）。
+注意 `/documents/download/{id}` 返回的是文件流，不是 `ApiResponse` 那层 JSON —— 它的**错误**响应才是统一格式。
+
+上传的边界（`multipart/form-data`，依赖 `python-multipart`，缺了它整个应用启动即崩）：
+扩展名白名单 `pdf/md/docx`（400）→ 知识库存在且属于你（404，防塞进别人的库）→
+流式算 sha256 并卡 20MB（413）→ 同库判重（409）→ 落盘 `data/{user_id}/{kb_id}/{document_id}.{ext}` →
+写库；任何一步失败都回滚已落盘的文件，不留垃圾。客户端的 `filename`/`Content-Length`/`Content-Type`
+全部按不可信处理（展示名会 sanitize 成最后一段，MIME 由扩展名派生）。
+
+删除文档的边界检查（顺序固定，任一条不过就**不碰磁盘**）：
+未登录 → 401；`document_id` 非 uuid / 为空 → 422（路径参数类型挡掉）；
+文档不存在或不属于你 → 404；`file_path` 是绝对路径、含 `..`、扩展名非法、
+或与 `document_storage_path` 算出的 `data/<user_id>/<kb_id>/<document_id>.<ext>` 不一致 → 只删记录并在 `msg` 里说明。
+
+`/documents/status` 的核对口径：拿库里每条 `file_path` 的文件名，和 `data/{user_id}/{kb_id}/` 目录里实际文件对比 ——
+库里没有文件的是 `missing_files`（文档打不开，需重新上传），磁盘多出来的是 `orphan_files`（垃圾，需清理），
+两者都空才算 `healthy=true`；不一致也返回 200，因为接口本身执行成功了，数据完整性要用字段表达。
 
 ## 数据表（5 张，向量化暂未启用）
 
@@ -128,5 +151,5 @@ chunks           切块：document_id/kb_id/owner_id + seq + content + token_cou
 ## 测试
 
 ```bash
-app/.venv/bin/python -m pytest      # 用临时 SQLite 跑完整流程，不依赖 PostgreSQL
+.venv/bin/python -m pytest      # 用临时 SQLite 跑完整流程，不依赖 PostgreSQL
 ```

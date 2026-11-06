@@ -7,8 +7,9 @@
 
 | 项 | 约定 |
 | --- | --- |
-| Python | **3.11+**（`app/pyproject.toml: requires-python`） |
-| 依赖管理 | 以 `app/pyproject.toml` + `app/uv.lock` 为准，`uv sync --group dev`；`requirements*.txt` 只给 pip 用户，改动要同步 |
+| Python | **3.11+**（`pyproject.toml: requires-python`） |
+| 虚拟环境 | 仓库根 `.venv`（`uv sync` 自动建）；项目根 = 导入根，所以一律 `from app.xxx import ...` |
+| 依赖管理 | 以 `pyproject.toml` + `uv.lock` 为准，`uv sync --group dev`；`requirements*.txt` 只给 pip 用户，改动要同步 |
 | Web | FastAPI（全异步）+ uvicorn |
 | ORM | SQLAlchemy **2.0/2.1 风格**：`Mapped[...]` + `mapped_column(...)`，禁止旧 `Column()` 写法 |
 | 校验 | Pydantic **v2**（`ConfigDict` / `field_validator`），禁止 v1 的 `class Config: orm_mode` |
@@ -88,7 +89,7 @@ async def list_documents(db: DB, user: CurrentUser, page: int = 1, size: int = 2
 crud 返回 `tuple[Sequence[Model], int]`（数据 + 总数），不要各写各的。
 
 ### 3.6 例外：流式接口
-LLM 流式回答（SSE / `text/event-stream`）**不能**套 `ApiResponse` 外层，改为每条事件一行 JSON：`{"status":200,"msg":"chunk","data":{"text":"..."}}`，结束发 `{"status":200,"msg":"done","data":{"references":[...]}}`；并在该路由上设 `response_class=StreamingResponse`、`response_model=None`，避免 FastAPI 试图校验。
+二进制/流式响应（`GET /documents/download/{id}` 的 `FileResponse`、LLM 流式回答 SSE）**不能**套 `ApiResponse` 外层，改为每条事件一行 JSON：`{"status":200,"msg":"chunk","data":{"text":"..."}}`，结束发 `{"status":200,"msg":"done","data":{"references":[...]}}`；并在该路由上设 `response_class=StreamingResponse`、`response_model=None`，避免 FastAPI 试图校验。
 
 ### 3.7 新增接口 checklist
 1. `app/schemas/{module}_schemas.py` 定 `XxxCreate/XxxUpdate/XxxOut`
@@ -98,7 +99,7 @@ LLM 流式回答（SSE / `text/event-stream`）**不能**套 `ApiResponse` 外�
 5. `app/api/v1/{module}router.py` 加路由 + `response_model=ApiResponse[...]` + 中文 `summary`
 6. `app/main.py` `include_router`（新模块时）
 7. `tests/test_{module}_api.py` 成功 + 每种失败各一条 + 越权一条
-8. `app/.venv/bin/python -m pytest` 全绿；`/docs` 里格式正确
+8. `.venv/bin/python -m pytest` 全绿；`/docs` 里格式正确
 
 ## 4. Schema（Pydantic v2）规范
 
@@ -115,8 +116,8 @@ LLM 流式回答（SSE / `text/event-stream`）**不能**套 `ApiResponse` 外�
 
 - **表结构只有一个真源：`app/db/models.py`**。改完必须做两件事：
   ```bash
-  app/.venv/bin/python scripts/init_db.py --drop        # 开发期重建（会清数据）
-  app/.venv/bin/python scripts/init_db.py --snapshot > init_db.sql   # 刷新那份 SQL 快照
+  .venv/bin/python scripts/init_db.py --drop        # 开发期重建（会清数据）
+  .venv/bin/python scripts/init_db.py --snapshot > init_db.sql   # 刷新那份 SQL 快照
   ```
   `init_db.sql` 是生成物，别手改；它只 `IF NOT EXISTS`，不会给已有表加列。
 - **uuid 传参**：`sa.Uuid` 在 SQLite 上只接受 `uuid.UUID` 对象，传 str 会报 `'str' object has no attribute 'hex'`。
@@ -127,6 +128,17 @@ LLM 流式回答（SSE / `text/event-stream`）**不能**套 `ApiResponse` 外�
 - **状态用常量**：`UserRole / KbVisibility / DocStatus`（`app/db/models.py` 里的 `StrEnum`），
   列类型是 varchar，不要在 PG 上 `CREATE TYPE ... AS ENUM`（改值太痛）；状态流转 `pending → parsing → chunking → indexed / failed`。
 - **统计与版本**：文档增删后必须调 `document_crud.refresh_kb_stats(kb_id, db)`（重算 document_count/chunk_count、`version+1`、`last_indexed_at`），别让知识库的版本号和真实内容脱节。
+- **存储路径约定（已定）**：`data/{user_id}/{kb_id}/{document_id}.{ext}`（相对进程 CWD），
+  库里 `documents.file_path` 存的也是这一串；唯一来源是
+  `services.process_document.document_storage_path()`，落盘/删除/列目录/边界校验都调它，
+  **不要在别处手拼字符串**（拼错了删除接口会拒绝删文件，只留孤儿文件）。
+  `user_id/kb_id/document_id` 必须是 uuid、`ext` 只允许字母数字，`document_storage_path` 会先校验再拼。
+- **按知识库分目录**的用意：`/status` 可以整目录 `ls` 出来和数据库对账（`missing_files` / `orphan_files`），
+  删库时也能整目录清理；核对必须用全量（`list_document_paths` 不分页）。
+- **删文件的边界**（`documentrouter._build_cleanup_target`，删数据类接口照这个套路）：
+  先把参数收在类型上（路径参数用 `uuid.UUID`，非法直接 422）→ 再用带 `owner_id` 的查询一次做完「存在性 + 归属」→
+  然后校验磁盘路径（空值 / 绝对路径 / 含 `..` / 扩展名不合法 / 与实际删除逻辑拼出的路径不一致 → 一律拒绝碰磁盘，只删记录）→
+  顺序固定「先删库成功，再删文件」，同步文件 IO 用 `run_in_threadpool` 跑，别阻塞事件循环。
 - 参数顺序固定：**业务参数在前，`db: AsyncSession` 永远是最后一个位置参数**（`get_user_by_id(user_id, db)`、`list_documents(owner_id, db, offset, limit, kb_id=...)`）。
 - 只用 `select()` + 参数化，禁止拼接 SQL 字符串；`like`/`ilike` 的值要转义。
 - `commit/rollback` 只发生在 crud 层；路由里不 `commit`。`get_db` 已负责异常回滚与关闭。
@@ -146,7 +158,14 @@ LLM 流式回答（SSE / `text/event-stream`）**不能**套 `ApiResponse` 外�
 - 让旧 token 失效的动作：登出删单条、改密/改邮箱删该用户全部（`token_crud.revoke_all_user_tokens`）、注销级联清除。
 - 密码只能 `get_password_hash` 入库；校验用 `verify_password`；日志/返回体禁止出现密码、`access_token`、`SECRET_KEY`。
 - `SECRET_KEY` 生产用随机值（`python -c "import secrets;print(secrets.token_urlsafe(48))"`）；生产 `DEBUG=False`（`DEBUG=True` 时 500 会把异常细节回给客户端）、`CORS_ORIGINS` 收敛成具体域名。
-- 上传文件：白名单扩展名 + MIME 双校验、大小限制、文件名 sanitize、落盘路径不含用户输入、存储目录不可执行。
+- 上传文件的边界（`/documents/upload` 已按这套实现，新接口照抄）：
+  1. `filename` 不可信 → 取最后一段做展示名（Windows 全路径/`../` 都拦掉）；
+  2. 扩展名先过字符集正则再过白名单；MIME 由白名单派生，不采信客户端 `Content-Type`；
+  3. `kb_id` 必须校验「存在 + 属于当前用户」，否则能把文件塞进别人的知识库；
+  4. 大小限制在**读流过程中**判（`Content-Length` 可以伪造），超限 413；
+  5. 落盘文件名只用 `document_id`（`data/{user_id}/{kb_id}/{document_id}.{ext}`），绝不用用户给的名字；
+  6. 判重用 `uq(kb_id, file_hash)`，且在写盘之前查，重复文件不落垃圾；
+  7. 写库失败要回滚已落盘的文件；同步 IO 一律 `run_in_threadpool`，别阻塞事件循环。
 
 ## 7. 配置规范
 
@@ -173,8 +192,8 @@ LLM 流式回答（SSE / `text/event-stream`）**不能**套 `ApiResponse` 外�
 - 每条路由至少覆盖：1 条成功 + 1 条最相关失败（401/403/404/409/422）+ 越权访问他人数据。
 - **所有断言走 `assert_envelope(resp, status)`**（`tests/test_user_api.py`），确保统一格式不被破坏：键必须恰好是 `status/msg/data`。
 - 服务层（chunker、prompt、retriever、解析器）写纯单测，不建 HTTP；涉及 embedding/LLM 时用假实现注入，测试不联网、不烧钱。
-- 命令：`app/.venv/bin/python -m pytest`（裸 `pytest` 依赖根目录 `pytest.ini` 的 `pythonpath=.`）。
-- 已知坑：`aiosqlite` 线程在受限沙箱里会挂起（宿主机正常）；`app/.venv` 是 uv 建的、里面没有 pip。
+- 命令：`.venv/bin/python -m pytest`（配置在根 `pyproject.toml` 的 `[tool.pytest.ini_options]`，`pythonpath=["."]` 保证 `import app` 找得到；裸 `pytest` 同样可用）。
+- 已知坑：`aiosqlite` 线程在受限沙箱里会挂起（宿主机正常）；`.venv` 是 uv 建的、里面没有 pip。
 
 ## 10. Git 规范
 
@@ -189,15 +208,18 @@ LLM 流式回答（SSE / `text/event-stream`）**不能**套 `ApiResponse` 外�
   ```
   类型：`feat` / `fix` / `refactor` / `docs` / `test` / `chore`；标题 ≤50 字、一句话说清做了什么，正文列要点。
 - **一次 commit 只做一件事**，且必须让 `pytest` 全绿（不要提交已知红灯）。
-- 禁止提交：`.env`、`data/`、真实业务文档、`app/.venv/`、`frontend/node_modules/`、模型权重、`__pycache__`。
+- 禁止提交：`.env`、`data/`、真实业务文档、`.venv/`、`frontend/node_modules/`、模型权重、`__pycache__`。
 - push 前自检：`git status` 干净 → `pytest` 绿 → `/docs` 看一眼返回格式 → 更新 `TODO.md` 勾选框。
 - 本项目 SSH 走 `ssh.github.com:443`（`~/.ssh/config`），remote 用 `git@github.com:<owner>/<repo>.git`。
 
 ## 11. 加依赖的规则
 
-- 先在 `app/pyproject.toml` 的 `dependencies` / `[dependency-groups].dev` 加约束，再 `uv sync`，最后同步 `requirements.txt`（运行时）或 `requirements-dev.txt`（开发/测试）。
+- 先在根目录 `pyproject.toml` 的 `dependencies` / `[dependency-groups].dev` 加约束，再在项目根 `uv sync --group dev`（venv 也在根），最后同步 `requirements.txt`（运行时）或 `requirements-dev.txt`（开发/测试）。
+- 本项目是「应用」不是「库」：`[tool.uv] package = false`，uv 只装依赖、不 build 项目自身（免得它去猜 frontend/scripts/tests 这些顶层目录）。
 - 重量级依赖（`torch`、`sentence-transformers`、`unstructured`）单独评估：能否用 API 方案替代、装不进 CI 时的降级路径、是否放到 `[project.optional-dependencies].local`。
-- 已知版本约束：`bcrypt>=4.0.1,<4.1`（passlib 1.7.4 认不了 4.1+ 的版本号）；SQLAlchemy 异步必须有 `greenlet`；TestClient 必须有 `httpx`。
+- 已知版本约束：`bcrypt>=4.0.1,<4.1`（passlib 1.7.4 认不了 4.1+ 的版本号）；SQLAlchemy 异步必须有 `greenlet`；
+  TestClient 必须有 `httpx`；**只要路由里出现 `UploadFile`/`File(...)` 就必须装 `python-multipart`**，
+  否则不是接口报错，而是 `import app.main` 直接失败、整个服务起不来。
 
 ## 12. 现状与已知不一致（新增时别再抄）
 
@@ -205,8 +227,9 @@ LLM 流式回答（SSE / `text/event-stream`）**不能**套 `ApiResponse` 外�
 | --- | --- | --- |
 | `userrouter.py` | `POST /update·/delete·/reset_password` 非 REST | 历史遗留，保留兼容；新模块用 REST（`/documents` 已在用 `DELETE`） |
 | `documentrouter.py` | `GET /detail`、`GET /status` 用 query 参数、`DELETE /delete/{id}` 路径重复动词 | M1 实现时收敛成 `GET /documents/{id}`、`DELETE /documents/{id}` |
-| `documentrouter.py` | 除 `/list` 外都是 501 占位；`document_crud` 已备好对应函数 | 按 TODO.md M0/M1 填实现，函数签名别再改一遍 |
-| `app/services/process_document.py` | 只有 `import os`，空壳 | M2 解析/切块的落点，删不删随你 |
+| `documentrouter.py` | 6 条路由全部实现 | 下一步做 M0 知识库 CRUD，否则前端拿不到 `kb_id` |
+| `app/services/process_document.py` | 路径唯一来源 `document_storage_path()`；落盘/删除/列目录（`new_document_file_path`、`delete_document_file`、`search_document_file`）都带 `kb_id`，同步 IO 一律由路由 `run_in_threadpool` 调 | M2 的解析/切块也放这里，别在路由里写文件操作 |
+| `app/services/process_document.py` | 删除逻辑已实现并被路由调用；解析/切块还是空的 | M2 的落点 |
 | `main.py` | 无日志、无请求 ID、无 429 限流 | P1 工程化补齐 |
 | `chunks.embedding` | 还没有向量列（按要求先不做 pgvector） | M3 再加列 + HNSW 索引，并回填 `knowledge_bases.embedding_model/embedding_dim` |
 | 已修复（别当坑抄） | `tokens` 存 JWT 原文 → 改 sha256；`get_optional_user` 漏校验吊销 token；`/user/info?user_id=` 越权面；`init_db.sql` 与 ORM 漂移 | — |
