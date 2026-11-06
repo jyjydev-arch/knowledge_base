@@ -2,10 +2,10 @@
 -- AI 知识库 · PostgreSQL 建表脚本（快照）
 --
 -- 真源是 app/db/models.py，本文件由下面命令生成，请勿手工编辑：
---     app/.venv/bin/python scripts/init_db.py --snapshot > init_db.sql
+--     .venv/bin/python scripts/init_db.py --snapshot > init_db.sql
 -- 日常建表建议直接跑：
---     app/.venv/bin/python scripts/init_db.py            # 只建缺失的表
---     app/.venv/bin/python scripts/init_db.py --drop     # 开发期重置（清空数据）
+--     .venv/bin/python scripts/init_db.py            # 只建缺失的表
+--     .venv/bin/python scripts/init_db.py --drop     # 开发期重置（清空数据）
 --
 -- 注意 1：本脚本只 CREATE ... IF NOT EXISTS，不会给已存在的表加列/改类型。
 --         改过 models.py 后，开发库请 --drop 重建，正式环境等接 alembic（TODO.md P1）。

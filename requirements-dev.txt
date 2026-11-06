@@ -1,6 +1,6 @@
 # ===== 开发 / 测试依赖（先装运行时依赖） =====
 -r requirements.txt
 
-pytest==9.2.0                                    # app/.venv/bin/python -m pytest
+pytest==9.2.0                                    # .venv/bin/python -m pytest
 httpx==0.28.1                                    # fastapi TestClient 需要
 aiosqlite==0.22.1                                # 测试用内存/临时文件 SQLite，不依赖本机 PG

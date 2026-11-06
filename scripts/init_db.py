@@ -2,10 +2,10 @@
 """建表脚本 —— 表结构以 app/db/models.py 为唯一真源
 
 用法（在项目根目录执行）:
-    app/.venv/bin/python scripts/init_db.py                 # 只建缺失的表（不动已有数据）
-    app/.venv/bin/python scripts/init_db.py --drop           # 开发期重置：删光所有表再建（会清空数据！）
-    app/.venv/bin/python scripts/init_db.py --check          # 库里表是否和模型对得上
-    app/.venv/bin/python scripts/init_db.py --snapshot > init_db.sql   # 刷新那份可读快照
+    .venv/bin/python scripts/init_db.py                 # 只建缺失的表（不动已有数据）
+    .venv/bin/python scripts/init_db.py --drop           # 开发期重置：删光所有表再建（会清空数据！）
+    .venv/bin/python scripts/init_db.py --check          # 库里表是否和模型对得上
+    .venv/bin/python scripts/init_db.py --snapshot > init_db.sql   # 刷新那份可读快照
 
 注意：create_all 只会「建缺失的表」，**不会给已有表加列/改类型**。
       改了 models.py 之后，开发库 --drop 重建，正式环境等接 alembic（TODO.md P1）。
@@ -31,10 +31,10 @@ SNAPSHOT_HEADER = """-- ========================================================
 -- AI 知识库 · PostgreSQL 建表脚本（快照）
 --
 -- 真源是 app/db/models.py，本文件由下面命令生成，请勿手工编辑：
---     app/.venv/bin/python scripts/init_db.py --snapshot > init_db.sql
+--     .venv/bin/python scripts/init_db.py --snapshot > init_db.sql
 -- 日常建表建议直接跑：
---     app/.venv/bin/python scripts/init_db.py            # 只建缺失的表
---     app/.venv/bin/python scripts/init_db.py --drop     # 开发期重置（清空数据）
+--     .venv/bin/python scripts/init_db.py            # 只建缺失的表
+--     .venv/bin/python scripts/init_db.py --drop     # 开发期重置（清空数据）
 --
 -- 注意 1：本脚本只 CREATE ... IF NOT EXISTS，不会给已存在的表加列/改类型。
 --         改过 models.py 后，开发库请 --drop 重建，正式环境等接 alembic（TODO.md P1）。

@@ -1,12 +1,12 @@
 # ===== AI 知识库后端 · 运行时依赖 =====
-# 与 app/pyproject.toml 的 [project].dependencies 对应；
-# 版本号取 app/.venv 里当前实测跑通（30 条接口测试通过）的版本。
+# 与 pyproject.toml 的 [project].dependencies 对应；
+# 版本号取 .venv 里当前实测跑通的版本（74 条测试全绿）。
 #
 #   pip install -r requirements.txt        # 用 pip
-#   cd app && uv sync --group dev          # 用 uv（推荐，uv.lock 是完整锁定文件）
+#   uv sync --group dev                    # 用 uv，在项目根执行（推荐，uv.lock 是完整锁定）
 #
 # 只列直接依赖，starlette / anyio / pydantic-core 等由它们自动带入。
-# Python 版本要求: >=3.11（见 app/pyproject.toml 的 requires-python）
+# Python 版本要求: >=3.11（见 pyproject.toml 的 requires-python）
 
 fastapi==0.162.0
 uvicorn==0.54.0
@@ -19,3 +19,4 @@ email-validator==2.3.0                           # EmailStr 校验
 passlib==1.7.4
 bcrypt==4.0.1                                    # 固定在 <4.1：passlib 1.7.4 认不了 4.1+ 的版本号
 PyJWT==2.15.1                                    # 依赖名是小写 pyjwt
+python-multipart==0.0.33                             # FastAPI 接收 UploadFile/File 必需，缺了整个应用启动即崩
