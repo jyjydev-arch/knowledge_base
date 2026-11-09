@@ -12,6 +12,7 @@
 | 文档模块 | ✅ 6 条路由全部实现：`/list`、`/upload`、`/detail`、`/status`（磁盘↔数据库核对）、`DELETE /delete/{id}`、`/download/{id}` | `app/api/v1/documentrouter.py` |
 | 解析 / 切块（M2） | ❌ 0 实现 | `app/services/process_document.py` 目前只有 `import os` |
 | 语义检索 / RAG 问答 | ❌ 0 实现 | 待建 `app/api/v1/searchrouter.py`、`chatrouter.py`；`chat_history` 表按要求后面再建 |
+| 知识库共享授权（read/write） | ✅ `kb_shares` 表 + 3 条路由 + `kb_access` 权限矩阵，6 条文档路由的越权口径已同步改造 | `app/api/v1/kbrouter.py`、`app/services/kb_access.py` |
 | 向量库 | ⏸️ **按要求先不做**：chunks 没有 embedding 列，`init_db.sql` 里的 `CREATE EXTENSION vector` 已注释（本机 PG17 也没装 pgvector） | `app/db/models.py` |
 | 数据库迁移 | ⚠️ 无 alembic；已改为「ORM 单一真源」+ `scripts/init_db.py`（建表/重置/检查/生成 SQL 快照） | `scripts/init_db.py` |
 | 后台任务（解析/向量化是慢活） | ❌ 无 | — |
@@ -29,7 +30,8 @@
 
 `documents.kb_id` 是 NOT NULL，所以没有知识库接口就传不进文档 —— 这是当前最卡脖子的一环。
 
-- [ ] `app/api/v1/kbrouter.py`：`POST /kb`（建库）、`GET /kb/list`、`GET /kb/detail?kb_id=`、`POST /kb/update`（改 name/description/chunk 配置）、`DELETE /kb/{kb_id}`（软删 + 级联清理）
+- [ ] `app/api/v1/kbrouter.py`：`POST /kb`（建库）、`GET /kb/list?scope=owned|shared|all`、`GET /kb/detail`、`POST /kb/update`（改 name/description/chunk 配置）、`DELETE /kb/{kb_id}`（软删 + 级联清理）
+      —— 授权三条已在同一个文件里做好了，新增的 5 条直接用 `KBReader/KBWriter/KBManager` 即可
 - [ ] `app/schemas/kb_schemas.py`：`KbCreate(name, description, visibility?, chunk_size?, chunk_overlap?)` / `KbOut`（含 document_count、chunk_count、**version**、last_indexed_at）
 - [ ] `app/db/crud/kb_crud.py`：查询一律带 `owner_id`；`refresh_kb_stats` 已在 `document_crud` 里，直接复用
 - [ ] `documentrouter` 的 upload/detail/status 接收 `kb_id` 参数（不传则用用户的默认库：`is_default` 或最早创建的那个）
@@ -37,11 +39,13 @@
 
 ### M1 文档上传与元数据（约 1 天）
 - ✅ M1 六条全部实现（含边界、判重、回滚、kb 版本联动、磁盘↔数据库一致性核对）
-- ⚠️ 但 **M0 知识库接口仍然没做**：前端现在拿不到 `kb_id`，只能靠手工往库里插数据；`/upload`、`/status` 都强依赖它
+- ⚠️ **M0 知识库接口仍然没做，现在比之前更关键**：有了共享授权之后，被授权人**没有任何接口能列出「别人共享给我的库」**（只能靠 owner 把 kb_id 告诉他）。`GET /kb/list` 必须同时返回 owned + shared 两类并标出各自 permission
+- 已完成的相邻能力：`POST/DELETE /kb/share`、`GET /kb/share/list`（owner only）、`kb_shares` 表、`KBReader/KBWriter/KBManager` 依赖
 - 依赖提醒：用了 `UploadFile`/`File(...)` 就必须装 `python-multipart`（已进 pyproject + requirements.txt），
   缺它不是接口报错，而是 `import app.main` 直接失败、服务起不来
 - 文件落地按约定 **`data/{user_id}/{kb_id}/{document_id}.{ext}`**，库里 `documents.file_path` 存的就是这一串相对路径；按知识库分目录后 `/status` 才能直接 ls 整个目录做一致性核对；`.gitignore` 已忽略 `/data/`
-- 唯一来源 `process_document.document_storage_path(user_id, kb_id, document_id, ext)`；`new_document_file_path` / `delete_document_file` / `search_document_file` 三个函数都带 `kb_id` 参数（签名已改）
+- 唯一来源 `document_storage_path(kb_owner_id, uploader_id, kb_id, document_id, ext)`；
+  `new_document_file_path` / `delete_document_file` / `search_document_files` / `kb_storage_dirs` 都按 (库owner, 上传者) 复算
 - 校验：类型白名单（pdf/docx/md/txt）、大小上限（默认 20MB，超限 `raise BusinessError(status=413)`）、文件名 sanitize
 - `Document.status` 流转：`pending → parsing → chunking → indexed / failed`（+ `error_msg`）
 - ~~补 documents 缺失列~~ ✅ 表已重做：title/file_path/file_size/mime_type/file_hash/status/error_msg/chunk_count/token_count/updated_at/deleted_at 都在，CRUD 也齐了（`create_document` 会自动 `refresh_kb_stats` 更新知识库版本）
@@ -52,8 +56,9 @@
 - 落点在已有的 `app/services/`：`process_document.py`（编排：读文件→解析→切块→写库；删除逻辑 `delete_document_file` 已写好并被路由调用）+ `parsers/`（`base.py` 协议 + `pdf.py`/`docx.py`/`markdown.py`/`text.py`，按扩展名工厂选择）
 - ✅ 路径约定已定：`data/{user_id}/{kb_id}/{document_id}.{ext}`，文档/注释已全部对齐（没有多余的 `documents/` 一层）。
 - ✅ 上传实现时把路径拼法收敛成唯一来源：`process_document.document_storage_path(user_id, document_id, ext)`，
-  落盘（`new_document_file_path`）、删除（`delete_document_file`）、边界校验（`documentrouter._build_cleanup_target`）都用它
+  落盘 / 删除 / 列目录 / 边界校验（`documentrouter._cleanup_plan`）都用它；复算失败只删记录不碰磁盘
 - ⏸️ 仍先不做：`UPLOAD_ROOT` 不提配置（路径相对进程 CWD，靠 `start.sh` 在项目根启动）、上传大小限制仍是路由里的常量 20MB
+- [ ] 一次性清理脚本：把已废弃布局（`data/kb/...`）里的历史文件搬回约定目录或直接删除（`/status` 扫不到它们）
 - 新依赖：`pypdf`、`python-docx`、（可选）`unstructured`；统一输出纯文本 + 页码/章节，写进 `chunks.page/heading/extra`
 - `app/services/chunker.py`：按段落/标题边界 + `chunk_size`(默认 500–800 token) + `overlap`(10–15%)；纯函数，先写单测再写库
 - ~~新表 chunks~~ ✅ 已建好（`id/document_id/kb_id/owner_id/seq/content/token_count/page/heading/extra`），只差 `embedding vector(N)` 列 + HNSW 索引
@@ -129,13 +134,14 @@
 已就位（`app/db/models.py`，建表走 `scripts/init_db.py`）：
 
 ```
-users / tokens / knowledge_bases / documents / chunks     ← 5 张，owner_id 全链路冗余
+users / tokens / knowledge_bases / documents / chunks / kb_shares
+                         ← 6 张；文档类数据全链路冗余 owner_id，授权表只挂 (kb_id, grantee_id)
 ```
 
 还缺：
 
 ```
-kb_shares            知识库分享（user_id + kb_id + permission(read/write)），P2 团队协作时建
+kb_invite / kb_join_request  邀请链接、加入申请（现在只能 owner 按 email 手工授权）
 password_reset_tokens 「忘记密码」验证码/重置链接，P1
 chat_sessions / chat_messages  会话与消息（含引用的 chunk_id 列表），P0-M5，你说了后面再建
 chunks.embedding     vector(N) + HNSW 索引，P0-M3，pgvector 方案定了再加（当前不做）

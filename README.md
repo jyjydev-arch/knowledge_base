@@ -18,15 +18,16 @@
 ├── scripts/
 │   └── init_db.py              # 建表 / --drop 重置 / --check / --snapshot 生成 SQL
 ├── tests/                      # 接口测试 + 表结构测试
-├── frontend/                   # Vue 前端（暂未接管）
-├── data/                       # 上传的原始文件（gitignore）
+├── frontend/
+├── data/                      # 知识库数据（文件、图片、视频、音频、文档、模型等）
 └── app/                        # 后端代码包
     ├── main.py                 # FastAPI 入口 + 统一返回格式的异常处理器
     ├── api/
-    │   ├── deps.py             # 公共依赖：DB Session、当前登录用户、管理员校验
+    │   ├── deps.py             # 公共依赖：DB Session、当前登录用户、管理员、KBReader/KBWriter/KBManager
     │   └── v1/
-    │       ├── userrouter.py   # 用户路由
-    │       └── documentrouter.py  # 文档路由
+    │       ├── userrouter.py       # 用户路由
+    │       ├── kbrouter.py         # 知识库授权路由（share / revoke / list）
+    │       └── documentrouter.py   # 文档路由
     ├── core/
     │   ├── config.py           # .env 配置
     │   ├── security.py         # 密码哈希 + JWT 签发/解析
@@ -34,10 +35,10 @@
     │   └── exceptions.py       # 业务异常（统一包成 status/msg/data）
     ├── db/
     │   ├── base.py             # DeclarativeBase
-    │   ├── models.py           # 表结构唯一真源：User / Token / KnowledgeBase / Document / Chunk
+    │   ├── models.py           # 表结构唯一真源：User / Token / KnowledgeBase / Document / Chunk / KbShare
     │   ├── psql_config.py      # 异步引擎、Session、get_db 依赖
     │   └── crud/               # 数据访问层（只读写库，不抛 HTTP 异常）
-    ├── services/               # 业务算法层：存储路径/落盘/删除，M2 起加解析切块
+    ├── services/               # 业务算法层：kb_access 权限判定、存储路径/落盘/删除，M2 起加解析切块
     └── schemas/                # ApiResponse[T] / PageData[T] / 各模块请求响应体
 ```
 
@@ -104,6 +105,25 @@ cp .env.example .env
 第一个管理员：注册时用户名命中 `.env` 的 `ADMIN_USERNAMES` 就直接写 `role=admin`，
 之后权限判断只看 `role`，不再依赖配置。
 
+### 知识库授权 `/kb`
+
+| 方法 | 路径 | 说明 | data |
+| --- | --- | --- | --- |
+| POST | `/kb/share?kb_id=` | owner 把库共享给某个邮箱的用户（`permission=read`/`write`），重复调用=更新权限 | 授权记录 |
+| DELETE | `/kb/share?kb_id=&email=` | owner 取消授权（幂等，没授权过也不报错） | null |
+| GET | `/kb/share/list?kb_id=` | owner 查看该库的授权名单 | 授权列表 |
+
+权限矩阵（判定实现只在 `app/services/kb_access.py` 一处）：
+
+| 操作 | owner | `write` 授权 | `read` 授权 | public 库的其他人 |
+| --- | :-: | :-: | :-: | :-: |
+| 看库信息 / 文档列表 / 详情 / 下载 / 状态 | ✓ | ✓ | ✓ | ✓ |
+| 上传文档 / 删除文档（**含别人传的**） | ✓ | ✓ | ✗ | ✗ |
+| 改库设置、删库、增删授权 | ✓ | ✗ | ✗ | ✗ |
+
+两条对外语义：连 `read` 都没有 → 一律 **404**（不暴露别人的库是否存在）；能读不能写 → **403**。
+共享库里别人上传的文件落在**库主人**目录下：`data/{库owner}/{kb_id}/{document_id}.{ext}`，一个库一个目录。
+
 ### 文档 `/documents`
 
 | 方法 | 路径 | 说明 | 状态 |
@@ -127,20 +147,32 @@ cp .env.example .env
 删除文档的边界检查（顺序固定，任一条不过就**不碰磁盘**）：
 未登录 → 401；`document_id` 非 uuid / 为空 → 422（路径参数类型挡掉）；
 文档不存在或不属于你 → 404；`file_path` 是绝对路径、含 `..`、扩展名非法、
-或与 `document_storage_path` 算出的 `data/<user_id>/<kb_id>/<document_id>.<ext>` 不一致 → 只删记录并在 `msg` 里说明。
+或与 `document_storage_path` 复算出的路径不一致（例如已废弃的老布局）→ 只删记录并在 `msg` 里说明。
 
-`/documents/status` 的核对口径：拿库里每条 `file_path` 的文件名，和 `data/{user_id}/{kb_id}/` 目录里实际文件对比 ——
-库里没有文件的是 `missing_files`（文档打不开，需重新上传），磁盘多出来的是 `orphan_files`（垃圾，需清理），
-两者都空才算 `healthy=true`；不一致也返回 200，因为接口本身执行成功了，数据完整性要用字段表达。
+存储路径按「谁上传」分两个落点，都由 `(库owner, 上传者, kb_id, document_id, ext)` 复算，所以事后一定删得对：
 
-## 数据表（5 张，向量化暂未启用）
+| 上传者 | 落点 |
+| --- | --- |
+| 库主人自己 | `data/{库owner}/{kb_id}/{document_id}.{ext}` |
+| 被授权的人 | `data/share/{kb_id}/{document_id}.{ext}` |
+
+被授权人的文件绝不写进库主人的个人目录（否则别人能耗光你的磁盘、删号时还留孤儿文件）；
+也不按上传者分散到 N 个目录（那样一个库要扫 N 处）。因此 `/status` 对账扫**两个**目录。
+
+`/documents/status` 的核对口径：`missing_files` 按每条记录的 `file_path` 逐个 `isfile` 判（精确，与目录布局无关）；
+`orphan_files` 扫该库的两个目录（库主人目录 + `data/share/{kb_id}/`）取差集。两者都空才算 `healthy=true`；
+不一致也返回 **200** —— 接口本身执行成功了，数据完整性用字段表达，不混 HTTP 语义。
+⚠️ 约定目录之外的历史文件（如已废弃的 `data/kb/...`）扫不到，需要一次性清理脚本，不属于接口职责。
+
+## 数据表（6 张，向量化暂未启用）
 
 ```
 users            账号：role(user/admin) / is_active / last_login_at / deleted_at
 tokens           已签发凭证：token_hash(sha256) / expires_at / client_ip / user_agent
 knowledge_bases  知识库总表：name + description(具体说明) + visibility + chunk_size/overlap
                  + document_count/chunk_count/version/last_indexed_at（文档变动时自动更新）
-documents        原始文件：kb_id + owner_id + title/filename/file_path/file_size/mime_type
+kb_shares        授权：kb_id + grantee_id + granted_by + permission(read/write)，uq(kb_id,grantee_id)
+documents        原始文件：kb_id + owner_id(上传者) + title/filename/file_path/file_size/mime_type
                  + file_hash(同库判重) + status(pending→parsing→chunking→indexed/failed) + error_msg
 chunks           切块：document_id/kb_id/owner_id + seq + content + token_count + page/heading + extra
                  ※ 还没有 embedding 向量列，等 pgvector 方案定了再补（当前确认先不做）

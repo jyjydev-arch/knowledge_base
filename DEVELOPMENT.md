@@ -133,9 +133,10 @@ crud 返回 `tuple[Sequence[Model], int]`（数据 + 总数），不要各写各
   `services.process_document.document_storage_path()`，落盘/删除/列目录/边界校验都调它，
   **不要在别处手拼字符串**（拼错了删除接口会拒绝删文件，只留孤儿文件）。
   `user_id/kb_id/document_id` 必须是 uuid、`ext` 只允许字母数字，`document_storage_path` 会先校验再拼。
-- **按知识库分目录**的用意：`/status` 可以整目录 `ls` 出来和数据库对账（`missing_files` / `orphan_files`），
-  删库时也能整目录清理；核对必须用全量（`list_document_paths` 不分页）。
-- **删文件的边界**（`documentrouter._build_cleanup_target`，删数据类接口照这个套路）：
+- **`/status` 对账的两条口径**：`missing_files` 用每条记录的 `file_path` 逐个 `isfile` 判（精确、与布局无关），
+  `orphan_files` 扫 `kb_storage_dirs(库owner, kb_id)` 返回的两个目录取差集 —— 少扫一个就会把协作上传的文件误判成垃圾；
+  核对必须全量（`list_document_paths` 不分页）。约定目录之外的历史文件扫不到，靠清理脚本而不是靠接口。
+- **删文件的边界**（`documentrouter._cleanup_plan`，删数据类接口照这个套路）：
   先把参数收在类型上（路径参数用 `uuid.UUID`，非法直接 422）→ 再用带 `owner_id` 的查询一次做完「存在性 + 归属」→
   然后校验磁盘路径（空值 / 绝对路径 / 含 `..` / 扩展名不合法 / 与实际删除逻辑拼出的路径不一致 → 一律拒绝碰磁盘，只删记录）→
   顺序固定「先删库成功，再删文件」，同步文件 IO 用 `run_in_threadpool` 跑，别阻塞事件循环。
@@ -157,7 +158,27 @@ crud 返回 `tuple[Sequence[Model], int]`（数据 + 总数），不要各写各
 - 鉴权链路固定四步：**有 header → JWT 能解析 → 用户存在 → token 未被吊销/过期**（见 `app/api/deps.py:get_current_user`）。
 - 让旧 token 失效的动作：登出删单条、改密/改邮箱删该用户全部（`token_crud.revoke_all_user_tokens`）、注销级联清除。
 - 密码只能 `get_password_hash` 入库；校验用 `verify_password`；日志/返回体禁止出现密码、`access_token`、`SECRET_KEY`。
-- `SECRET_KEY` 生产用随机值（`python -c "import secrets;print(secrets.token_urlsafe(48))"`）；生产 `DEBUG=False`（`DEBUG=True` 时 500 会把异常细节回给客户端）、`CORS_ORIGINS` 收敛成具体域名。
+- `SECRET_KEY` 生产用随机值（`python -c "import secrets;print(secrets.token_urlsafe(48))"`）；生产 `APP_DEBUG=False`（为 True 时 500 会把异常细节回给客户端）；配置项一律带项目前缀语义 —— **别用裸 `DEBUG` 这种通用名**，本机 shell 里的 `DEBUG=release` 就能把应用炸掉、`CORS_ORIGINS` 收敛成具体域名。
+- **权限判定只有一个入口**：`app/services/kb_access.py`。
+  - 依赖注入：`KBReader` / `KBWriter` / `KBManager`（工厂 `require_kb_access(mode)`，`kb_id` 自动从路径或 query 取）；
+  - 资源级判定：`kb_access.document_access(document, user_id, db)`；
+  - 列表可见范围：`kb_access.accessible_kb_ids(user_id, db)`（自己的 + 被授权的 + public 的）。
+  **越权语义固定两条**：连 read 都没有 → `404`（不暴露资源存在）；能 read 不能 write → `403` 并在 msg 里说明需要什么权限。
+  不要再写 `WHERE owner_id = 当前用户` 这种只看上传者的查询 —— 共享库里别人传的文档合法可见，
+  正确做法是 `get_document_any(id)` + 权限判定；确实不涉及共享时才用 `get_document(id, owner_id)`。
+- **权限矩阵**（改任何一条都要同步 `kb_access.py` 顶部那张表 + README）：
+
+| 操作 | owner | write 授权 | read 授权 | public 库的其他人 |
+| --- | :-: | :-: | :-: | :-: |
+| 看库信息 / 文档列表 / 详情 / 下载 / 状态 | ✓ | ✓ | ✓ | ✓ |
+| 上传文档 / 删除文档（含别人传的） | ✓ | ✓ | ✗ | ✗ |
+| 改库设置、删库、增删授权 | ✓ | ✗ | ✗ | ✗ |
+
+  `write ⊃ read`，所以 `kb_shares` 只存一个 `permission` 字段；授权人只能给**更高的那一档**以外的读写组合（read/write），
+  再次授权（write→read）是**降级**且幂等更新，不新增记录。**只有 owner 能授权**，防止权限人传人失控。
+- **共享库的文件落库主人目录**：`data/{kb.owner_id}/{kb_id}/{document_id}.{ext}`。
+  上传者记在 `documents.owner_id`，目录主人取 `knowledge_bases.owner_id` —— 一个库一个目录，
+  对账（`/documents/status`）、备份、删库都只碰两处；`_cleanup_plan(document, kb_owner_id)` 显式接收库 owner，别从 current_user 猜。
 - 上传文件的边界（`/documents/upload` 已按这套实现，新接口照抄）：
   1. `filename` 不可信 → 取最后一段做展示名（Windows 全路径/`../` 都拦掉）；
   2. 扩展名先过字符集正则再过白名单；MIME 由白名单派生，不采信客户端 `Content-Type`；
@@ -228,7 +249,8 @@ crud 返回 `tuple[Sequence[Model], int]`（数据 + 总数），不要各写各
 | `userrouter.py` | `POST /update·/delete·/reset_password` 非 REST | 历史遗留，保留兼容；新模块用 REST（`/documents` 已在用 `DELETE`） |
 | `documentrouter.py` | `GET /detail`、`GET /status` 用 query 参数、`DELETE /delete/{id}` 路径重复动词 | M1 实现时收敛成 `GET /documents/{id}`、`DELETE /documents/{id}` |
 | `documentrouter.py` | 6 条路由全部实现 | 下一步做 M0 知识库 CRUD，否则前端拿不到 `kb_id` |
-| `app/services/process_document.py` | 路径唯一来源 `document_storage_path()`；落盘/删除/列目录（`new_document_file_path`、`delete_document_file`、`search_document_file`）都带 `kb_id`，同步 IO 一律由路由 `run_in_threadpool` 调 | M2 的解析/切块也放这里，别在路由里写文件操作 |
+| `app/services/process_document.py` | 路径唯一来源 `document_storage_path()`；落盘/删除/列目录都带 `kb_id`，同步 IO 一律由路由 `run_in_threadpool` 调 | M2 的解析/切块也放这里，别在路由里写文件操作 |
+| `app/services/kb_access.py` | 权限矩阵与越权语义的唯一实现处 | 新增资源（会话、导出、批量操作）先接它，别自己判 owner_id |
 | `app/services/process_document.py` | 删除逻辑已实现并被路由调用；解析/切块还是空的 | M2 的落点 |
 | `main.py` | 无日志、无请求 ID、无 429 限流 | P1 工程化补齐 |
 | `chunks.embedding` | 还没有向量列（按要求先不做 pgvector） | M3 再加列 + HNSW 索引，并回填 `knowledge_bases.embedding_model/embedding_dim` |
