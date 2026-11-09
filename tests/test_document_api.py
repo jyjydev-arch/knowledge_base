@@ -111,8 +111,17 @@ def test_pagination(client, logged_in, run):
 
 # ---------------- DELETE /documents/delete/{document_id} ----------------
 def canonical_file_path(user_id: str, kb_id: str, document_id) -> str:
-    """按 services.process_document.document_storage_path 的规则拼出来的路径"""
+    """document_storage_path 的「库主人自己上传」分支：data/{owner}/{kb_id}/{doc_id}.md"""
     return f"data/{user_id}/{kb_id}/{document_id}.md"
+
+
+# 语义更清楚的别名（上传者就是库主人时用它）
+own_file_path = canonical_file_path
+
+
+def share_file_path(kb_id, document_id) -> str:
+    """document_storage_path 的「被授权人上传」分支：data/share/{kb_id}/{doc_id}.md"""
+    return f"data/share/{kb_id}/{document_id}.md"
 
 
 def seed_document_with_file(run, logged_in, monkeypatch, tmp_path, *, file_path=None, with_file=True, chunks=2):
@@ -265,27 +274,33 @@ def test_delete_twice_returns_404(client, logged_in, run, monkeypatch, tmp_path)
 
 
 def test_service_delete_document_file_helper(tmp_path, monkeypatch):
-    """直接验证删除逻辑：命中返回 True，文件不在返回 False（不抛异常），非法段拒绝拼路径"""
+    """删除逻辑：命中 True / 不在 False（不抛异常）/ 两个分支都能复算定位 / 非法段拒绝拼路径"""
     import uuid as uuid_lib
 
     monkeypatch.chdir(tmp_path)
-    uid, kb_id, doc_id = str(uuid_lib.uuid4()), str(uuid_lib.uuid4()), str(uuid_lib.uuid4())
-    target = tmp_path / "data" / uid / kb_id
-    target.mkdir(parents=True)
-    (target / f"{doc_id}.md").write_text("x")
+    owner, other, kb_id, doc_id = (str(uuid_lib.uuid4()) for _ in range(4))
 
-    assert delete_document_file(uid, kb_id, doc_id, "md") is True
-    assert not (target / f"{doc_id}.md").exists()
-    assert delete_document_file(uid, kb_id, doc_id, "md") is False
+    # 库主人自己传的 → 个人目录 data/{owner}/{kb_id}/
+    own_dir = tmp_path / "data" / owner / kb_id
+    own_dir.mkdir(parents=True)
+    (own_dir / f"{doc_id}.md").write_text("x")
+    assert delete_document_file(owner, owner, kb_id, doc_id, "md") is True
+    assert not (own_dir / f"{doc_id}.md").exists()
+    assert delete_document_file(owner, owner, kb_id, doc_id, "md") is False
 
-    # 拼路径前的字符校验：不是 uuid 的段一律拒绝，别拿它去拼目录
+    # 被授权人传的 → data/share/{kb_id}/，用 (库owner, 上传者) 复算同样能定位
+    share_dir = tmp_path / "data" / "share" / kb_id
+    share_dir.mkdir(parents=True)
+    (share_dir / f"{doc_id}.md").write_text("y")
+    assert delete_document_file(owner, other, kb_id, doc_id, "md") is True
+    assert not (share_dir / f"{doc_id}.md").exists()
+
+    # 拼路径前的字符校验：非法 uuid / 非法扩展名一律拒绝，绝不去拼目录
     with pytest.raises(ValueError):
-        delete_document_file("../../etc", kb_id, doc_id, "md")
+        delete_document_file(owner, other, "../../etc", doc_id, "md")
     with pytest.raises(ValueError):
-        delete_document_file(uid, kb_id, doc_id, "md/../sh")
+        delete_document_file(owner, other, kb_id, doc_id, "md/../sh")
 
-
-# ---------------- POST /documents/upload ----------------
 def make_kb(run, user_id, name="上传目标库"):
     """建一个属于该用户的知识库，返回 kb_id（str）"""
 
@@ -308,13 +323,25 @@ def upload(client, headers, *, kb_id, content=b"# doc body\nfirst line", filenam
     )
 
 
-def uploaded_files(tmp_path, user_id, kb_id=None):
-    root = tmp_path / "data" / str(user_id)
-    if kb_id is not None:
-        root = root / str(kb_id)
-    if not root.exists():
-        return []
-    return sorted(p.name for p in root.rglob("*") if p.is_file())
+def uploaded_files(tmp_path, kb_owner_id=None, kb_id=None):
+    """返回文件名列表
+
+    - 传 (kb_owner_id, kb_id)：只看这个库的**两个**目录（库主人目录 + data/share/）；
+      少扫一个就会把协作上传的文件误判成 orphan，这一点在 /status 那边同理。
+    - 不传：扫整个 data/，用来断言「失败回滚后没留垃圾」。
+    """
+    if kb_id is None:
+        roots = [tmp_path / "data"]
+    else:
+        roots = [
+            tmp_path / "data" / str(kb_owner_id) / str(kb_id),
+            tmp_path / "data" / "share" / str(kb_id),
+        ]
+    names = []
+    for root in roots:
+        if root.exists():
+            names.extend(item.name for item in root.rglob("*") if item.is_file())
+    return sorted(set(names))
 
 
 def test_upload_success(client, logged_in, run, engine, monkeypatch, tmp_path):
@@ -699,3 +726,41 @@ def test_download_rejects_path_outside_user_dir(client, logged_in, run, monkeypa
     resp = client.get(f"/api/v1/documents/download/{doc_id}", headers=logged_in["headers"])
     assert resp.status_code == 403, resp.text
     assert "机密" not in resp.text
+
+
+def test_legacy_layout_is_readable_but_not_deleted(client, logged_in, run, monkeypatch, tmp_path):
+    """老布局遗留（data/kb/...）：仍能下载（读比删宽松）；删除只删记录、不碰磁盘
+
+    注意 /status 的 orphan_files 只扫当前约定的两个目录，所以放在 data/kb/ 里的历史文件
+    不会被报出来 —— 这类遗留要靠一次性清理脚本处理，不属于接口职责。
+    """
+    kb_id = make_kb(run, logged_in["user_id"], name="遗留布局库")
+
+    async def _seed(session):
+        doc = await _add_doc(
+            session, _u(kb_id), _u(logged_in["user_id"]), filename="遗留.md", file_hash="legacy-hash"
+        )
+        doc.file_path = f"data/kb/{kb_id}/{doc.id}.md"     # 上一轮废弃的约定
+        await session.commit()
+        return str(doc.id)
+
+    monkeypatch.chdir(tmp_path)
+    doc_id = run(_seed)
+    legacy = tmp_path / "data" / "kb" / kb_id / f"{doc_id}.md"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("旧位置的内容")
+
+    dl = client.get(f"/api/v1/documents/download/{doc_id}", headers=logged_in["headers"])
+    assert dl.status_code == 200 and dl.text == "旧位置的内容"
+
+    status = assert_envelope(
+        client.get(f"/api/v1/documents/status?kb_id={kb_id}", headers=logged_in["headers"]), 200
+    )["data"]
+    assert status["missing_files"] == []      # 按 file_path 精判：文件在，只是位置是老的
+    assert status["orphan_files"] == []       # 不在约定目录里，扫不到也不乱报
+
+    body = assert_envelope(
+        client.delete(f"/api/v1/documents/delete/{doc_id}", headers=logged_in["headers"]), 200
+    )
+    assert "存储路径不合法" in body["msg"]
+    assert legacy.exists()                     # 不按新规则乱删老文件

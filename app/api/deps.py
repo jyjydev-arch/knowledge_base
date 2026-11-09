@@ -1,16 +1,17 @@
 """路由层公共依赖：数据库 Session、当前登录用户"""
 
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import Depends
+from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import ForbiddenError, UnauthorizedError
+from app.core.exceptions import ForbiddenError, NotFoundError, ParamError, UnauthorizedError
 from app.core.security import decode_access_token
-from app.db.crud import token_crud, user_crud
+from app.db.crud import kb_crud, token_crud, user_crud
 from app.db.models import User
 from app.db.psql_config import get_db
+from app.services.kb_access import KbAccess, resolve
 
 # auto_error=False: 没带 Authorization 时由我们自己返回统一的 {"status":401,...}
 bearer_scheme = HTTPBearer(auto_error=False, description="JWT，格式: Bearer <access_token>")
@@ -87,6 +88,47 @@ async def require_admin_dep(user: User = Depends(get_current_user)) -> User:
         raise ForbiddenError("需要管理员权限")
     return user
 
+
+AccessMode = Literal["read", "write", "manage"]
+
+
+def require_kb_access(mode: AccessMode = "read"):
+    """知识库权限依赖注入工厂：mode ∈ {"read", "write", "manage"}
+
+    kb_id 从路径参数或 query 参数里取（两种写法的路由都能用同一个依赖）。
+    判定规则全部委托 app/services/kb_access.py，这里只负责取参数 + 抛统一异常：
+        没带 kb_id                       → 400
+        库不存在 / 已软删 / 连 read 都没有 → 404（不暴露别人的库是否存在）
+        能 read 但不够 write/manage       → 403，msg 说清需要什么权限
+    """
+    async def _dep(
+        request: Request,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+    ) -> KbAccess:
+        kb_id = request.path_params.get("kb_id") or request.query_params.get("kb_id")
+        if not kb_id:
+            raise ParamError("缺少 kb_id 参数")
+
+        kb = await kb_crud.get_kb(kb_id, db)
+        if kb is None:
+            raise NotFoundError("知识库不存在")
+
+        access = await resolve(kb, current_user.id, db)
+        if not access.can_read:
+            raise NotFoundError("知识库不存在")
+        if mode == "write":
+            access.require_write()
+        elif mode == "manage":
+            access.require_manage()
+        return access
+
+    return _dep
+
+
+KBReader = Annotated[KbAccess, Depends(require_kb_access("read"))]
+KBWriter = Annotated[KbAccess, Depends(require_kb_access("write"))]
+KBManager = Annotated[KbAccess, Depends(require_kb_access("manage"))]
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
 AdminUser = Annotated[User, Depends(require_admin_dep)]

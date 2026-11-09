@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.v1.documentrouter import router as document_router
+from app.api.v1.kbrouter import router as kb_router
 from app.api.v1.userrouter import router as user_router
 from app.core.config import settings
 from app.core.exceptions import BusinessError
@@ -92,6 +93,7 @@ async def unhandled_error_handler(request: Request, exc: Exception):
 # ---------------- 路由（以后新增模块就再多 import 一个 router 多 include 一次） ----------------
 app.include_router(user_router, prefix=settings.API_V1_PREFIX)
 app.include_router(document_router, prefix=settings.API_V1_PREFIX)
+app.include_router(kb_router, prefix=settings.API_V1_PREFIX)
 
 
 @app.get("/", response_model=ApiResponse[dict], summary="根路径", tags=["Meta"])

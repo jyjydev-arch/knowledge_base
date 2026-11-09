@@ -10,7 +10,7 @@ import uuid as uuid_lib
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,13 +33,22 @@ async def list_documents(
     limit: int = 20,
     kb_id=None,
     status: str | None = None,
+    accessible_kb_ids=None,
 ) -> tuple[Sequence[Document], int]:
-    """按时间倒序分页取当前用户的文档，返回 (数据, 总数)"""
+    """按时间倒序分页取「我看得见的」文档，返回 (数据, 总数)
+
+    可见范围 = 我自己传的 ∪ 我有读权限的库里的文档（含别人共享给我的库）。
+    accessible_kb_ids 由 kb_access.accessible_kb_ids() 给出；不传就退化成只看自己的，
+    这样旧调用点行为不变，不会出现「忘了传就泄露」的反向事故。
+    """
     uid = _to_uuid(owner_id)
     if uid is None:
         return [], 0
 
-    conditions = [Document.owner_id == uid, Document.deleted_at.is_(None)]
+    visible = [Document.owner_id == uid]
+    if accessible_kb_ids:
+        visible.append(Document.kb_id.in_(list(accessible_kb_ids)))
+    conditions = [or_(*visible), Document.deleted_at.is_(None)]
     if kb_id is not None:
         pk = _to_uuid(kb_id)
         if pk is None:
@@ -62,7 +71,7 @@ async def list_documents(
 
 
 async def get_document(document_id, owner_id, db: AsyncSession) -> Document | None:
-    """取单个文档，owner 不匹配就当不存在（避免探测别人的文档 id）"""
+    """只取「我自己传的」文档（不涉共享的场景用它，越权直接当不存在）"""
     did, uid = _to_uuid(document_id), _to_uuid(owner_id)
     if did is None or uid is None:
         return None
@@ -72,18 +81,17 @@ async def get_document(document_id, owner_id, db: AsyncSession) -> Document | No
     return result.scalar_one_or_none()
 
 
-async def get_knowledge_base(kb_id, owner_id, db: AsyncSession) -> KnowledgeBase | None:
-    """上传文档前必须先过这一关：知识库得存在、没被删、而且是当前用户自己的
+async def get_document_any(document_id, db: AsyncSession) -> Document | None:
+    """按 id 取文档，不带 owner 过滤
 
-    少了这一步就能把文件塞进别人的知识库（kb_id 是客户端传进来的）。
+    共享之后「不是自己传的」也可能合法可见，所以能不能访问交给
+    kb_access.document_access() 判 —— 注意：调用方必须判权限，别直接拿数据回前端。
     """
-    pk, uid = _to_uuid(kb_id), _to_uuid(owner_id)
-    if pk is None or uid is None:
+    did = _to_uuid(document_id)
+    if did is None:
         return None
     result = await db.execute(
-        select(KnowledgeBase).where(
-            KnowledgeBase.id == pk, KnowledgeBase.owner_id == uid, KnowledgeBase.deleted_at.is_(None)
-        )
+        select(Document).where(Document.id == did, Document.deleted_at.is_(None))
     )
     return result.scalar_one_or_none()
 
@@ -180,17 +188,16 @@ async def delete_document(document: Document, db: AsyncSession) -> bool:
     return True
 
 
-async def count_by_status(owner_id, db: AsyncSession, kb_id=None) -> dict[str, int]:
-    """各状态的文档数量，给 GET /documents/status 用"""
-    uid = _to_uuid(owner_id)
-    if uid is None:
+async def count_by_status(kb_id, db: AsyncSession) -> dict[str, int]:
+    """某个知识库内各状态的文档数量（给 GET /documents/status 用）
+
+    这里按 kb 统计、不按上传者过滤：共享库里别人传的文档也算这个库的状态，
+    调用方必须先用 kb_access 确认请求者对该库有读权限。
+    """
+    pk = _to_uuid(kb_id)
+    if pk is None:
         return {}
-    conditions = [Document.owner_id == uid, Document.deleted_at.is_(None)]
-    if kb_id is not None:
-        pk = _to_uuid(kb_id)
-        if pk is None:
-            return {}
-        conditions.append(Document.kb_id == pk)
+    conditions = [Document.kb_id == pk, Document.deleted_at.is_(None)]
 
     result = await db.execute(
         select(Document.status, func.count()).where(*conditions).group_by(Document.status)
@@ -201,17 +208,18 @@ async def count_by_status(owner_id, db: AsyncSession, kb_id=None) -> dict[str, i
     return counts
 
 
-async def list_document_paths(kb_id, owner_id, db: AsyncSession) -> list[str]:
+async def list_document_paths(kb_id, db: AsyncSession) -> list[str]:
     """某个知识库下全部文档的存储路径（给 /status 做「磁盘 ↔ 数据库」核对）
 
-    不分页：核对必须看到全量，翻页会导致误判成文件缺失。
+    不分页、不按上传者过滤：核对必须是全量，否则共享库里别人传的文档会被误判成缺失。
+    调用方先确认请求者对该库有读权限。
     """
-    pk, uid = _to_uuid(kb_id), _to_uuid(owner_id)
-    if pk is None or uid is None:
+    pk = _to_uuid(kb_id)
+    if pk is None:
         return []
     result = await db.execute(
         select(Document.file_path)
-        .where(Document.kb_id == pk, Document.owner_id == uid, Document.deleted_at.is_(None))
+        .where(Document.kb_id == pk, Document.deleted_at.is_(None))
         .order_by(Document.created_at.desc())
     )
     return [row for row in result.scalars().all() if row]

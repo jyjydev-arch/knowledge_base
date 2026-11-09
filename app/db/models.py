@@ -58,8 +58,19 @@ class UserRole(StrEnum):
 class KbVisibility(StrEnum):
     """knowledge_bases.visibility"""
 
-    PRIVATE = "private"  # 仅owner + 被共享的用户可见
-    PUBLIC = "public"    # 全站可见（只读）
+    PRIVATE = "private"  # 仅 owner + kb_shares 里授权过的用户可见
+    PUBLIC = "public"    # 全站登录用户只读（不需要逐条授权）
+
+
+class KbPermission(StrEnum):
+    """knowledge_bases 的访问级别（owner 隐式拥有全部权限，不入表）"""
+
+    READ = "read"    # 能看库信息/文档列表/详情/下载/状态
+    WRITE = "write"  # READ 的一切 + 上传/删除文档（含别人传的，团队库语义）
+
+
+# 权限高低比较用这个顺序；owner 单独用 is_owner 判断（改库设置/删库/授权只有 owner 能做）
+PERMISSION_LEVEL = {KbPermission.READ: 1, KbPermission.WRITE: 2}
 
 
 class DocStatus(StrEnum):
@@ -183,6 +194,9 @@ class KnowledgeBase(Base, TimestampMixin, SoftDeleteMixin):
 
     owner: Mapped["User"] = relationship(back_populates="knowledge_bases")
     documents: Mapped[list["Document"]] = relationship(back_populates="knowledge_base", cascade="all, delete-orphan")
+    shares: Mapped[list["KbShare"]] = relationship(
+        "KbShare", back_populates="knowledge_base", cascade="all, delete-orphan", foreign_keys="KbShare.kb_id"
+    )
 
 
 class Document(Base, TimestampMixin, SoftDeleteMixin):
@@ -267,3 +281,38 @@ class Chunk(Base):
     )
 
     document: Mapped["Document"] = relationship(back_populates="chunks")
+
+
+class KbShare(Base, TimestampMixin):
+    """知识库授权表：把某个库共享给另一个用户（read / write）
+
+    规则（见 DEVELOPMENT.md 权限矩阵）：
+        - 只有 owner 能增删授权；owner 不需要这张表，隐式拥有全部权限；
+        - write ⊃ read，所以这里只存一个 permission 字段，取最高一条即可（uq 保证不重复）；
+        - knowledge_bases.visibility=public 是「全站只读」的快捷方式，不走这张表；
+        - 删库/改库设置/改授权一律 owner，被授权人哪怕 write 也不行。
+    """
+
+    __tablename__ = "kb_shares"
+    __table_args__ = (
+        UniqueConstraint("kb_id", "grantee_id", name="uq_kb_share_kb_grantee"),
+        Index("ix_kb_share_grantee", "grantee_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID_TYPE, primary_key=True, default=uuid.uuid4)
+    kb_id: Mapped[uuid.UUID] = mapped_column(
+        UUID_TYPE, ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False
+    )
+    grantee_id: Mapped[uuid.UUID] = mapped_column(
+        UUID_TYPE, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    # 谁授的权，用于审计；授权人注销后不牵连删除这条记录（库本身会随 owner 删除而级联）
+    granted_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID_TYPE, ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    permission: Mapped[str] = mapped_column(
+        String(16), default=KbPermission.READ, server_default=text("'read'"), nullable=False
+    )
+
+    knowledge_base: Mapped["KnowledgeBase"] = relationship("KnowledgeBase", back_populates="shares")
+    grantee: Mapped["User"] = relationship("User", foreign_keys=[grantee_id])

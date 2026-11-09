@@ -6,6 +6,7 @@
 CRUD 层每条查询都带 owner_id，越权在数据层就挡掉。
 """
 
+import asyncio
 import uuid
 from pathlib import Path as FsPath
 from typing import Annotated
@@ -14,7 +15,7 @@ from fastapi import APIRouter, BackgroundTasks, File, Path, Query, UploadFile
 from fastapi.responses import FileResponse
 from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import DB, CurrentUser
+from app.api.deps import DB, KBReader, KBWriter, CurrentUser
 from app.core.document_hash import calculate_document_hash
 from app.core.exceptions import (
     BusinessError,
@@ -24,16 +25,18 @@ from app.core.exceptions import (
     ParamError,
 )
 from app.db.crud import document_crud
+from app.services import kb_access
 from app.schemas.common import ApiResponse, PageData, PageParams
 from app.schemas.document_schemas import DocumentDetail, DocumentResponse, DocumentStatusOut
 from app.services.process_document import (
     SAFE_EXT,
     delete_document_file,
     document_storage_path,
-    kb_storage_dir,
+    kb_storage_dirs,
+    missing_file_paths,
     new_document_file_path,
-    remove_kb_directory_if_empty,
-    search_document_file,
+    remove_kb_directories_if_empty,
+    search_document_files,
 )
 
 router = APIRouter(prefix="/documents", tags=["Documents"])  # 版本前缀统一在 main.py 加，别在这里再写一遍
@@ -75,15 +78,17 @@ def _safe_extension(filename: str) -> str:
     return ext
 
 
-def _cleanup_plan(document) -> tuple[str, str, str] | None:
-    """从文档记录算出「可以安全删除」的 (user_id, kb_id, ext)；不可信就返回 None
+def _cleanup_plan(document, kb_owner_id) -> tuple[str, str] | None:
+    """复算出「可以安全删除」的 (kb_id, ext)；路径不可信就返回 None
 
-    校验点（顺序固定，任一不过就只删记录、绝不碰磁盘）：
+    复算规则只有一条：document_storage_path(库owner, 上传者=document.owner_id, kb_id, document_id, ext)。
+    上传时用的就是它，所以只要这几个值没变，就一定能算回当初落盘的位置 ——
+    「事后能删对」全靠这个可复算性，所以路径规则里绝不能出现会变化的东西（比如是否被共享）。
+
+    校验点（任一不过就只删记录、绝不碰磁盘）：
         空路径 / 绝对路径 / 含 .. / 扩展名不合法 /
-        与 document_storage_path(user_id, kb_id, document_id, ext) 拼出来的路径不一致 /
-        解析后跳出本人目录。
-    最后一条最关键：删除是不可逆操作，宁可留个孤儿文件（/status 会报 orphan_files），
-    也不能删错别人的东西。
+        与复算结果不一致（老布局遗留记录）/ 不在该库两个允许目录之内。
+    删除不可逆，宁可留孤儿文件让 /status 报 orphan_files，也不能删错东西。
     """
     if not document.file_path:
         return None
@@ -97,19 +102,27 @@ def _cleanup_plan(document) -> tuple[str, str, str] | None:
         return None
 
     try:
-        expected = FsPath(document_storage_path(document.owner_id, document.kb_id, document.id, ext))
-    except ValueError:  # service 层的 uuid 段校验没过
+        expected = FsPath(
+            document_storage_path(kb_owner_id, document.owner_id, document.kb_id, document.id, ext)
+        )
+        allowed_dirs = {FsPath(d).resolve() for d in kb_storage_dirs(kb_owner_id, document.kb_id)}
+    except ValueError:  # service 层的 uuid 段/扩展名校验没过
         return None
 
     if expected != stored:
         return None
-    if expected.resolve().parent != FsPath(kb_storage_dir(document.owner_id, document.kb_id)).resolve():
+    if expected.resolve().parent not in allowed_dirs:
         return None
-    return str(document.owner_id), str(document.kb_id), ext
+    return str(document.kb_id), ext
 
 
 def _readable_path(document) -> FsPath | None:
-    """下载用的路径判定：比删除宽松（老记录可能不是当前约定拼的），但仍不能跳出本人目录"""
+    """下载用的路径判定：比删除宽松，但仍不能跳出 data/
+
+    读一个文件的风险远小于删一个文件，所以这里只要求「落在 data 根下面且不含 ..」——
+    老布局（data/kb/... 或 data/{uid}/{kb_id}/...）的记录仍然能下载；
+    删除则必须逐字复算成功才动手（见 _cleanup_plan），宁可留孤儿文件也不删错。
+    """
     if not document.file_path:
         return None
 
@@ -117,10 +130,10 @@ def _readable_path(document) -> FsPath | None:
     if stored.is_absolute() or ".." in stored.parts:
         return None
 
-    # file_path 已经带 data/ 前缀，直接相对 CWD 解析，不能再拼一次 USER_DATA_ROOT
-    owner_root = (USER_DATA_ROOT / str(document.owner_id)).resolve()
+    # file_path 本身已经带 data/ 前缀，直接相对 CWD 解析，不能再拼一次 USER_DATA_ROOT
+    data_root = USER_DATA_ROOT.resolve()
     resolved = stored.resolve()
-    if owner_root not in resolved.parents:
+    if data_root not in resolved.parents:
         return None
     return resolved
 
@@ -144,8 +157,10 @@ async def list_documents(
         - ApiResponse.ok 的第一个参数是 data，不是 status（原写法 status="success" 会直接 500）。
     """
     params = PageParams(page=page, size=size)
+    # 可见范围 = 自己传的 + 有读权限的库（含被共享的），共享库里的文档别人传的也能看到
+    accessible = await kb_access.accessible_kb_ids(current_user.id, db)
     documents, total = await document_crud.list_documents(
-        current_user.id, db, params.offset, params.limit, kb_id=kb_id
+        current_user.id, db, params.offset, params.limit, kb_id=kb_id, accessible_kb_ids=accessible
     )
     data = PageData[DocumentResponse](
         items=[DocumentResponse.model_validate(doc) for doc in documents],
@@ -160,6 +175,7 @@ async def list_documents(
 async def upload_document(
     background_tasks: BackgroundTasks,
     current_user: CurrentUser,
+    access: KBWriter,
     db: DB,
     file: Annotated[UploadFile, File(description="要上传的文档（pdf / md / docx）")],
     kb_id: Annotated[str, Query(description="所属知识库ID")],
@@ -194,10 +210,8 @@ async def upload_document(
     original_name = _safe_basename(file.filename)
     ext = _safe_extension(original_name)
 
-    # 2. 知识库归属边界
-    kb = await document_crud.get_knowledge_base(kb_id, current_user.id, db)
-    if kb is None:
-        raise NotFoundError("知识库不存在")
+    # 2. 知识库权限边界（require_kb_access("write") 已经做完：不存在→404，只读授权→403）
+    kb = access.kb
 
     # 3. 内容指纹 + 体积上限
     file_hash, file_size = await calculate_document_hash(file, max_bytes=MAX_UPLOAD_BYTES)
@@ -206,12 +220,20 @@ async def upload_document(
     if await document_crud.get_document_by_hash(kb.id, file_hash, db) is not None:
         raise ConflictError("该文件已在此知识库中，未重复入库")
 
-    # 5. 先生成 id，再按约定落盘：data/{user_id}/{kb_id}/{document_id}.{ext}
+    # 5. 先生成 id，再按约定落盘：
+    #      自己是库主人 → data/{user_id}/{kb_id}/{document_id}.{ext}
+    #      自己是   被授权人 → data/share/{kb_id}/{document_id}.{ext}
     document_id = uuid.uuid4()
-    stored_path = document_storage_path(current_user.id, kb.id, document_id, ext)
+    stored_path = document_storage_path(kb.owner_id, current_user.id, kb.id, document_id, ext)
     try:
         await run_in_threadpool(
-            new_document_file_path, file, str(current_user.id), str(kb.id), str(document_id), ext
+            new_document_file_path,
+            file,
+            str(kb.owner_id),
+            str(current_user.id),
+            str(kb.id),
+            str(document_id),
+            ext,
         )
     except OSError:
         raise BusinessError("文件保存失败，请稍后重试", status=500)
@@ -231,24 +253,26 @@ async def upload_document(
             document_id=document_id,
         )
     except Exception as exc:
-        await _cleanup_uploaded_file(current_user.id, kb.id, document_id, ext)
+        await _cleanup_uploaded_file(kb.owner_id, current_user.id, kb.id, document_id, ext)
         raise BusinessError("文档入库失败，已回滚", status=500) from exc
 
     if document is None:  # 外键失败 / 并发下撞了唯一索引
-        await _cleanup_uploaded_file(current_user.id, kb.id, document_id, ext)
+        await _cleanup_uploaded_file(kb.owner_id, current_user.id, kb.id, document_id, ext)
         raise ConflictError("文档入库失败，请重试")
 
     return ApiResponse.ok(DocumentResponse.model_validate(document), msg="上传成功")
 
 
-async def _cleanup_uploaded_file(user_id, kb_id, document_id: uuid.UUID, ext: str) -> None:
+async def _cleanup_uploaded_file(kb_owner_id, uploader_id, kb_id, document_id: uuid.UUID, ext: str) -> None:
     """回滚用：删掉刚落盘但没能入库的文件，并把空出来的知识库目录一并收掉
 
     删不掉也只是留个孤儿文件（/status 会报出来），不影响接口结果，所以这里吞掉 OSError。
     """
     try:
-        await run_in_threadpool(delete_document_file, str(user_id), str(kb_id), str(document_id), ext)
-        await run_in_threadpool(remove_kb_directory_if_empty, str(user_id), str(kb_id))
+        await run_in_threadpool(
+            delete_document_file, str(kb_owner_id), str(uploader_id), str(kb_id), str(document_id), ext
+        )
+        await run_in_threadpool(remove_kb_directories_if_empty, str(kb_owner_id), str(kb_id))
     except OSError:
         pass
 
@@ -275,8 +299,8 @@ async def delete_document(
     落地顺序（先判边界，再动数据和磁盘）：
         a. 401：未登录/token 失效由 CurrentUser 依赖挡掉；
         b. 需求 7-9：document_id 声明成路径参数 uuid.UUID，空值/非 uuid/不合法 FastAPI 直接 422；
-        c. 需求 6：document_crud.get_document(id, owner_id, db) 一次做完「存在性 + 归属」，
-           别人的文档和不存在一律 404，不透露归属；
+        c. 需求 6：document_crud.get_document_any + kb_access 判权限，
+           别人的私有文档和不存在一律 404，不透露归属；
         d. 路径边界：_cleanup_plan(document) 按 document_storage_path 重算路径，
            绝对路径 / 含 .. / 扩展名不合法 / 与约定路径对不上 / 跳出本人目录 —— 一律返回 None，
            也就是只删记录不碰磁盘（宁可留孤儿文件让 /status 报 orphan_files，也不能删错东西）；
@@ -288,14 +312,18 @@ async def delete_document(
     为什么先删库再删文件：库里查不到就是对外一致的状态；反过来（文件先没了、库没删掉）
     会留下「有记录却读不到文件」的坏数据，比残留一个孤儿文件难恢复得多。
     """
-    # c. 存在性 + 归属
-    document = await document_crud.get_document(document_id, current_user.id, db)
+    # c. 存在性 + 权限：共享库里有 write 权限也能删别人传的文档
+    document = await document_crud.get_document_any(document_id, db)
     if document is None:
         raise NotFoundError(DOCUMENT_NOT_FOUND_MSG)
+    access = await kb_access.document_access(document, current_user.id, db)
+    if access is None or not access.can_read:
+        raise NotFoundError(DOCUMENT_NOT_FOUND_MSG)   # 连读都没有 → 不暴露它存在
+    access.require_write()
 
     # d. 路径边界（只读校验，此刻还不碰磁盘）
-    plan = _cleanup_plan(document)
-    user_id, kb_id, ext = plan if plan else (None, None, None)
+    plan = _cleanup_plan(document, access.kb.owner_id)
+    kb_id, ext = plan if plan else (None, None)
 
     # e. 先删数据库
     if not await document_crud.delete_document(document, db):
@@ -306,8 +334,10 @@ async def delete_document(
 
     # f. 再删磁盘文件
     try:
-        removed = await run_in_threadpool(delete_document_file, user_id, kb_id, str(document_id), ext)
-        await run_in_threadpool(remove_kb_directory_if_empty, user_id, kb_id)
+        removed = await run_in_threadpool(
+            delete_document_file, str(access.kb.owner_id), str(document.owner_id), kb_id, str(document_id), ext
+        )
+        await run_in_threadpool(remove_kb_directories_if_empty, str(access.kb.owner_id), kb_id)
     except OSError:
         return ApiResponse.ok(msg="文档记录已删除，但磁盘文件清理失败，请稍后重试")
 
@@ -332,12 +362,15 @@ async def document_detail(
            不算错误，前端按 chunk_total=0 提示「尚未解析」）；
         3. kb_name / kb_version 一起返回，正好对上需求里的「当前知识库的版本信息」。
     """
-    document = await document_crud.get_document(document_id, current_user.id, db)
+    document = await document_crud.get_document_any(document_id, db)
     if document is None:
         raise NotFoundError(DOCUMENT_NOT_FOUND_MSG)
+    access = await kb_access.document_access(document, current_user.id, db)
+    if access is None or not access.can_read:
+        raise NotFoundError(DOCUMENT_NOT_FOUND_MSG)
 
-    chunks = await document_crud.list_chunks(document_id, current_user.id, db, limit=preview_chunks)
-    kb = await document_crud.get_knowledge_base(document.kb_id, current_user.id, db)
+    chunks = await document_crud.list_chunks(document_id, document.owner_id, db, limit=preview_chunks)
+    kb = access.kb
 
     preview = "\n\n".join(chunk.content for chunk in chunks if chunk.content)
     detail = DocumentDetail.model_validate(document).model_copy(
@@ -369,8 +402,11 @@ async def download_document(
            所以这条接口的错误响应才是统一格式，正常响应走 Content-Disposition 下载；
            Content-Disposition 用 documents.filename（原始名）而不是 document_id.ext。
     """
-    document = await document_crud.get_document(document_id, current_user.id, db)
+    document = await document_crud.get_document_any(document_id, db)
     if document is None:
+        raise NotFoundError(DOCUMENT_NOT_FOUND_MSG)
+    access = await kb_access.document_access(document, current_user.id, db)
+    if access is None or not access.can_read:
         raise NotFoundError(DOCUMENT_NOT_FOUND_MSG)
 
     path = _readable_path(document)
@@ -388,9 +424,8 @@ async def download_document(
 
 @router.get("/status", response_model=ApiResponse[DocumentStatusOut], summary="知识库/文档状态")
 async def document_status(
-    current_user: CurrentUser,
+    access: KBReader,
     db: DB,
-    kb_id: Annotated[str, Query(description="知识库ID")],
 ):
     """
     显示当前知识库内容的状态，包括文档解析状态
@@ -398,25 +433,29 @@ async def document_status(
     落地说明：
         1. kb_id 先过「存在 + 属于当前用户」，否则 404（原来的写法这里会直接 TypeError）；
         2. 解析进度用 document_crud.count_by_status，五种状态都会补齐 0，前端不用猜键；
-        3. 一致性核对按你的思路做，但改成可判定的结构化结果而不是比 len：
-           库里每条记录的 file_path 取文件名，和 data/{user_id}/{kb_id}/ 目录下的实际文件对比，
-           缺的进 missing_files（文档打不开）、多的进 orphan_files（占空间的垃圾）；
+        3. 一致性核对：
+           missing_files = 按每条记录的 file_path 逐个 os.path.isfile 判（精确，不受目录布局影响）
+           orphan_files  = 扫 data/{库owner}/{kb_id}/ 与 data/share/{kb_id}/ 两个目录，
+                           磁盘有但库里没记录的（协作产生的垃圾、失败残留）
         4. 空库不是异常：document_total=0 且 healthy=true，msg 说明「目前没有文件」；
         5. 不一致也返回 200 + healthy=false —— 接口本身执行成功了，
            数据完整性问题要用数据字段表达，别用 HTTP 状态码混着业务语义。
     """
-    kb = await document_crud.get_knowledge_base(kb_id, current_user.id, db)
-    if kb is None:
-        raise NotFoundError("知识库不存在")
+    # 权限判定交给依赖：不存在/没读权限 → 404（依赖里已经做完了）
+    kb = access.kb
 
-    counts = await document_crud.count_by_status(current_user.id, db, kb_id=kb.id)
-    stored_paths = await document_crud.list_document_paths(kb.id, current_user.id, db)
-    # 列目录是同步 IO，放线程池里跑
-    disk_files = await run_in_threadpool(search_document_file, str(current_user.id), str(kb.id))
+    counts = await document_crud.count_by_status(kb.id, db)
+    stored_paths = await document_crud.list_document_paths(kb.id, db)
+    # 两个目录（库主人目录 + data/share）都要看，同步 IO 放线程池
+    disk_files, missing_paths = await asyncio.gather(
+        run_in_threadpool(search_document_files, str(kb.owner_id), str(kb.id)),
+        run_in_threadpool(missing_file_paths, stored_paths),
+    )
 
     disk_names = set(disk_files)
     expected_names = {FsPath(path).name for path in stored_paths}
-    missing_files = sorted(name for name in expected_names if name not in disk_names)
+    # 缺失以每条记录的 file_path 为准（精确），多余以目录扫描为准（能抓到没入库的垃圾文件）
+    missing_files = sorted(FsPath(path).name for path in missing_paths)
     orphan_files = sorted(name for name in disk_names if name not in expected_names)
     healthy = not missing_files and not orphan_files
 

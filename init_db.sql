@@ -74,9 +74,9 @@ CREATE TABLE IF NOT EXISTS tokens (
 	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS ix_tokens_user_expires ON tokens (user_id, expires_at);
-
 CREATE INDEX IF NOT EXISTS ix_tokens_expires ON tokens (expires_at);
+
+CREATE INDEX IF NOT EXISTS ix_tokens_user_expires ON tokens (user_id, expires_at);
 
 CREATE TABLE IF NOT EXISTS documents (
 	id UUID NOT NULL, 
@@ -104,6 +104,23 @@ CREATE TABLE IF NOT EXISTS documents (
 CREATE INDEX IF NOT EXISTS ix_document_kb_created ON documents (kb_id, created_at);
 
 CREATE INDEX IF NOT EXISTS ix_document_owner_status ON documents (owner_id, status);
+
+CREATE TABLE IF NOT EXISTS kb_shares (
+	id UUID NOT NULL, 
+	kb_id UUID NOT NULL, 
+	grantee_id UUID NOT NULL, 
+	granted_by UUID, 
+	permission VARCHAR(16) DEFAULT 'read' NOT NULL, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	updated_at TIMESTAMP WITH TIME ZONE, 
+	PRIMARY KEY (id), 
+	CONSTRAINT uq_kb_share_kb_grantee UNIQUE (kb_id, grantee_id), 
+	FOREIGN KEY(kb_id) REFERENCES knowledge_bases (id) ON DELETE CASCADE, 
+	FOREIGN KEY(grantee_id) REFERENCES users (id) ON DELETE CASCADE, 
+	FOREIGN KEY(granted_by) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_kb_share_grantee ON kb_shares (grantee_id);
 
 CREATE TABLE IF NOT EXISTS chunks (
 	id UUID NOT NULL, 
