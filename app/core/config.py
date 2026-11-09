@@ -25,7 +25,9 @@ class Settings(BaseSettings):
     APP_NAME: str = "AI知识库系统"
     APP_DESCRIPTION: str = "这是一个ai知识库系统"
     APP_VERSION: str = "0.1.0"
-    DEBUG: bool = True
+    # 环境变量只认 APP_DEBUG：裸 DEBUG 是个被用烂的名字（node 的 debug 包、各种 shell 都设过，
+    # 本机就有 DEBUG=release），字段名直接叫 DEBUG 会被外面的值污染成非法布尔 → 应用起不来。
+    DEBUG: bool = Field(default=True, validation_alias="APP_DEBUG")
     API_V1_PREFIX: str = "/api/v1"
 
     # ---------------- 数据库 ----------------
