@@ -28,6 +28,13 @@ api（路由/依赖）  →  schemas（入参出参）  →  services（业务�
 - **路由（`app/api/v1/*`）要薄**：只做「取参 → 调 crud/service → 组装 `ApiResponse`」。单函数超过 ~40 行、或含算法（切块、检索、prompt 拼装），抽到 `app/services/xxx.py`。
 - **CRUD（`app/db/crud/*`）不抛 HTTP 异常**：查不到返回 `None`，唯一索引冲突 `except IntegrityError: await db.rollback(); return None`，由路由决定提示语。
 - **service 层不碰 Session 之外的东西**：纯函数优先（chunker、prompt、解析器），方便单测。
+- **格式解析一律放 `app/services/parsers/`**，不要放 `app/utils/`：
+  解析器带明确业务语义（产出 ParsedBlock 给切块用、字段要落进 chunks.page/heading/extra），
+  属于「业务算法层」。`app/utils/` 只留无业务含义的通用小工具（文本归一化、时间处理这类），
+  **没有内容就别建目录**，空目录只会让人以为那里有东西。
+  新增一种格式只需两步：① 在 `parsers/` 写一个 `parse(path) -> ParsedDocument`；
+  ② 在 `parsers/registry.py` 的 `PARSERS` / `MIME_BY_EXT` 各加一行 ——
+  上传白名单 `documentrouter.ALLOWED_EXTENSIONS` 直接取注册表，不用改第三处（有测试锁这条一致性）。
 - `app/api/deps.py` 只放依赖注入（DB/鉴权/权限），路由文件里不重复写鉴权逻辑。
 - 包内**不放 `__init__.py`**（PEP 420 命名空间包），导入一律写全路径：`from app.db.crud import user_crud`。
 

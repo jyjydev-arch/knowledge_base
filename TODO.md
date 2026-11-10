@@ -10,7 +10,8 @@
 | 统一返回格式 + 全局异常包装 | ✅ 已实现 | `app/schemas/common.py`、`app/main.py` |
 | JWT 鉴权 + token 落库（可吊销） | ✅ 已实现 | `app/api/deps.py`、`app/db/crud/token_crud.py` |
 | 文档模块 | ✅ 6 条路由全部实现：`/list`、`/upload`、`/detail`、`/status`（磁盘↔数据库核对）、`DELETE /delete/{id}`、`/download/{id}` | `app/api/v1/documentrouter.py` |
-| 解析 / 切块（M2） | ❌ 0 实现 | `app/services/process_document.py` 目前只有 `import os` |
+| 文档解析（M2 前半） | ✅ 四种格式 + 注册表 + 预览 CLI（`scripts/parse_document.py`），15 条测试 | `app/services/parsers/` |
+| 切块 + 解析入库（M2 后半） | ❌ 未做：解析结果还没接进上传流程，`documents.status` 停在 pending | `app/services/process_document.py`、待建 `chunker.py` |
 | 语义检索 / RAG 问答 | ❌ 0 实现 | 待建 `app/api/v1/searchrouter.py`、`chatrouter.py`；`chat_history` 表按要求后面再建 |
 | 知识库共享授权（read/write） | ✅ `kb_shares` 表 + 3 条路由 + `kb_access` 权限矩阵，6 条文档路由的越权口径已同步改造 | `app/api/v1/kbrouter.py`、`app/services/kb_access.py` |
 | 向量库 | ⏸️ **按要求先不做**：chunks 没有 embedding 列，`init_db.sql` 里的 `CREATE EXTENSION vector` 已注释（本机 PG17 也没装 pgvector） | `app/db/models.py` |
@@ -52,8 +53,29 @@
 - 验收：上传→查列表→查状态→删除→级联文件被清理；owner 隔离（A 不能看/删 B 的文档，`document_crud` 每个查询都带 `owner_id`）
 - ✅ 删除部分已完成并有 9 条测试覆盖（成功/文件不存在/目录穿越/路径不一致/越权 404/非 uuid 422/重复删 404/未登录 401/服务函数单测）
 
-### M2 解析 + 切块（约 1–2 天）
-- 落点在已有的 `app/services/`：`process_document.py`（编排：读文件→解析→切块→写库；删除逻辑 `delete_document_file` 已写好并被路由调用）+ `parsers/`（`base.py` 协议 + `pdf.py`/`docx.py`/`markdown.py`/`text.py`，按扩展名工厂选择）
+### M2 解析 + 切块（约 1–2 天）—— 解析部分 ✅ 已完成，切块与入库待做
+
+已完成（`app/services/parsers/`，15 条测试）：
+
+| 模块 | 能力 | 已知边界 |
+| --- | --- | --- |
+| `base.py` | `ParsedBlock/ParsedDocument`、`clean_text` 归一化、`DocumentParseError` | docx/PDF 里的 `\x07`、no-break space 都在这层统一收 |
+| `registry.py` | 扩展名 → 解析器；白名单与 MIME 唯一来源 | 先判扩展名再开文件；三方异常统一收口成 `DocumentParseError` |
+| `markdown.py` | ATX/Setext 标题栈、front-matter、代码块保护，块带 `heading` 路径 | — |
+| `pdf.py` | 按页出块（`page`），加密/损坏/无文字分别报错 | **扫描件/图片型 PDF 需要 OCR，还没做**；中文提取取决于源文件是否内嵌字体 |
+| `docx.py` | 按 body 顺序遍历段落+表格，样式名识别 1–9 级标题 | 只支持 `.docx`，老 `.doc` 需要 LibreOffice 预转；docx 无可靠页码，`page` 留空 |
+| `pptx.py` | 每页一块 + 备注单独成块（`kind=notes`）+ 表格 | 只支持 `.pptx`；纯图片页会得到空结果并报错 |
+
+剩余（按顺序做）：
+
+- [ ] `app/services/chunker.py`：按 `heading` 分组 → 组内滑窗切块（长度用 `kb.chunk_size/chunk_overlap`），块继承 `page/heading/extra`
+- [ ] 把解析+切块接进上传后的流程：`app/services/process_document.py` 里加 `process_document(document_id)`，
+      用 `registry.parse_file(document.file_path)` → `chunker` → 批量写 `chunks` → 更新 `documents.status/chunk_count/token_count`
+- [ ] `documents.status` 流转真正跑起来（`pending → parsing → chunking → indexed / failed` + `error_msg`），
+      失败要能重索引且幂等（先按 `document_id` 删旧块再插）
+- [ ] 后台执行：先 FastAPI `BackgroundTasks`（`/upload` 里那个 `background_tasks` 参数就是留的坑），量大再换 arq/celery
+- [ ] OCR 通道（扫描件）与 `.doc/.ppt` 老格式预转 —— 优先级看实际资料构成
+- 落点在 `app/services/parsers/`（✅ 已建：base/registry/pdf/docx/pptx/markdown），编排入口留给 `process_document.process_document(document_id)`
 - ✅ 路径约定已定：`data/{user_id}/{kb_id}/{document_id}.{ext}`，文档/注释已全部对齐（没有多余的 `documents/` 一层）。
 - ✅ 上传实现时把路径拼法收敛成唯一来源：`process_document.document_storage_path(user_id, document_id, ext)`，
   落盘 / 删除 / 列目录 / 边界校验（`documentrouter._cleanup_plan`）都用它；复算失败只删记录不碰磁盘

@@ -16,7 +16,8 @@
 ├── init_db.sql                 # 由 models.py 生成的 PG 建表快照（勿手改）
 ├── start.sh                    # 启动脚本（uvicorn app.main:app --reload）
 ├── scripts/
-│   └── init_db.py              # 建表 / --drop 重置 / --check / --snapshot 生成 SQL
+│   ├── init_db.py              # 建表 / --drop 重置 / --check / --snapshot 生成 SQL
+│   └── parse_document.py       # 解析预览 CLI：看一个文件被切成哪些块（M2 排错用）
 ├── tests/                      # 接口测试 + 表结构测试
 ├── frontend/
 ├── data/                      # 知识库数据（文件、图片、视频、音频、文档、模型等）
@@ -38,7 +39,10 @@
     │   ├── models.py           # 表结构唯一真源：User / Token / KnowledgeBase / Document / Chunk / KbShare
     │   ├── psql_config.py      # 异步引擎、Session、get_db 依赖
     │   └── crud/               # 数据访问层（只读写库，不抛 HTTP 异常）
-    ├── services/               # 业务算法层：kb_access 权限判定、存储路径/落盘/删除，M2 起加解析切块
+    ├── services/               # 业务算法层
+    │   ├── kb_access.py        # 知识库权限矩阵与越权语义的唯一实现处
+    │   ├── process_document.py # 存储路径规则、落盘、删除、列目录
+    │   └── parsers/            # 格式解析：base / registry / pdf / docx / pptx / markdown
     └── schemas/                # ApiResponse[T] / PageData[T] / 各模块请求响应体
 ```
 
@@ -136,10 +140,19 @@ cp .env.example .env
 | GET | `/download/{document_id}` | 下载原始文件（`FileResponse`，用 `filename` 原始名，路径越界一律拒绝） | ✅ 已实现 |
 
 文档 6 条路由已全部实现（`NotImplementedFeatureError` → 501 保留给以后新增接口占位用）。
+
+支持上传的格式由解析器注册表决定：**`pdf / docx / pptx / md / txt`**，
+加一种格式只要在 `app/services/parsers/registry.py` 登记，上传接口自动放行（有测试锁这条一致性）。
+解析目前做到「能读、能预览」，还没接进上传后的自动流程（`documents.status` 停在 `pending`）：
+
+```bash
+.venv/bin/python scripts/parse_document.py 需求说明书.docx        # 按块打印：页码/标题路径/表格/备注
+.venv/bin/python scripts/parse_document.py slides.pptx --json     # 结构化输出，喂给 M2 排错
+```
 注意 `/documents/download/{id}` 返回的是文件流，不是 `ApiResponse` 那层 JSON —— 它的**错误**响应才是统一格式。
 
 上传的边界（`multipart/form-data`，依赖 `python-multipart`，缺了它整个应用启动即崩）：
-扩展名白名单 `pdf/md/docx`（400）→ 知识库存在且属于你（404，防塞进别人的库）→
+扩展名白名单由解析器注册表决定（不在表内 400）→ 知识库存在且属于你（404，防塞进别人的库）→
 流式算 sha256 并卡 20MB（413）→ 同库判重（409）→ 落盘 `data/{user_id}/{kb_id}/{document_id}.{ext}` →
 写库；任何一步失败都回滚已落盘的文件，不留垃圾。客户端的 `filename`/`Content-Length`/`Content-Type`
 全部按不可信处理（展示名会 sanitize 成最后一段，MIME 由扩展名派生）。
