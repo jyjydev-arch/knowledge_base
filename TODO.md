@@ -12,7 +12,7 @@
 | 文档模块 | ✅ 6 条路由全部实现：`/list`、`/upload`、`/detail`、`/status`（磁盘↔数据库核对）、`DELETE /delete/{id}`、`/download/{id}` | `app/api/v1/documentrouter.py` |
 | 文档解析（M2 前半） | ✅ 四种格式 + 注册表 + 预览 CLI（`scripts/parse_document.py`），15 条测试 | `app/services/parsers/` |
 | 切块 + 解析入库（M2 后半） | ❌ 未做：解析结果还没接进上传流程，`documents.status` 停在 pending | `app/services/process_document.py`、待建 `chunker.py` |
-| 语义检索 / RAG 问答 | ❌ 0 实现 | 待建 `app/api/v1/searchrouter.py`、`chatrouter.py`；`chat_history` 表按要求后面再建 |
+| 语义检索 / RAG 问答 | ❌ 未实现。仅有草案：`app/api/v1/aichatrouter.py`（9 条路由全 pass，未 include）、`app/rag/agent.py`（导入期就读到不存在的 settings 字段，会 AttributeError） | 待建 `app/api/v1/searchrouter.py`；`conversations`/`messages` 与 `chat_history` 表按要求后面再建 |
 | 知识库共享授权（read/write） | ✅ `kb_shares` 表 + 3 条路由 + `kb_access` 权限矩阵，6 条文档路由的越权口径已同步改造 | `app/api/v1/kbrouter.py`、`app/services/kb_access.py` |
 | 向量库 | ⏸️ **按要求先不做**：chunks 没有 embedding 列，`init_db.sql` 里的 `CREATE EXTENSION vector` 已注释（本机 PG17 也没装 pgvector） | `app/db/models.py` |
 | 数据库迁移 | ⚠️ 无 alembic；已改为「ORM 单一真源」+ `scripts/init_db.py`（建表/重置/检查/生成 SQL 快照） | `scripts/init_db.py` |
