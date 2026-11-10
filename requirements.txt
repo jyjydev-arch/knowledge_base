@@ -20,3 +20,12 @@ passlib==1.7.4
 bcrypt==4.0.1                                    # 固定在 <4.1：passlib 1.7.4 认不了 4.1+ 的版本号
 PyJWT==2.15.1                                    # 依赖名是小写 pyjwt
 python-multipart==0.0.33                             # FastAPI 接收 UploadFile/File 必需，缺了整个应用启动即崩
+
+# 文档解析（M2 用，app/services/parsers/）
+pypdf==7.0.0                                         # PDF 文本提取；中文能否提出取决于文件内嵌字体
+python-docx==1.2.0                                   # .docx（不支持老 .doc，要另装 LibreOffice 转换）
+python-pptx==1.0.2                                   # .pptx（同样不支持老 .ppt）
+
+# LLM / Agent（app/rag/ 目前还没接到路由上，接口未上线，先记着依赖存在）
+langchain==1.4.9
+langchain-openai==1.7.4
