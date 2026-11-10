@@ -28,6 +28,7 @@ from app.db.crud import document_crud
 from app.services import kb_access
 from app.schemas.common import ApiResponse, PageData, PageParams
 from app.schemas.document_schemas import DocumentDetail, DocumentResponse, DocumentStatusOut
+from app.services.parsers.registry import MIME_BY_EXT
 from app.services.process_document import (
     SAFE_EXT,
     delete_document_file,
@@ -46,11 +47,9 @@ USER_DATA_ROOT = FsPath("data")  # 相对进程 CWD（start.sh 在项目根启�
 PREVIEW_MAX_CHARS = 2000  # 详情正文预览的截断长度
 PREVIEW_CHUNKS = 3        # 预览最多取前几块
 
-ALLOWED_EXTENSIONS = {
-    "pdf": "application/pdf",
-    "md": "text/markdown",
-    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-}
+# 白名单唯一来源是解析器注册表：新增一种格式只需在 registry 里登记，
+# 否则会出现「解析器支持但上传拒收」或「上传收下但解析不了」两张皮
+ALLOWED_EXTENSIONS = MIME_BY_EXT
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20MB
 
 DOCUMENT_NOT_FOUND_MSG = "文档不存在"
@@ -177,7 +176,7 @@ async def upload_document(
     current_user: CurrentUser,
     access: KBWriter,
     db: DB,
-    file: Annotated[UploadFile, File(description="要上传的文档（pdf / md / docx）")],
+    file: Annotated[UploadFile, File(description="要上传的文档（" + " / ".join(sorted(ALLOWED_EXTENSIONS)) + "）")],
     kb_id: Annotated[str, Query(description="所属知识库ID")],
     document_name: Annotated[str | None, Query(description="文档标题，不传则用原文件名（去扩展名）")] = None,
 ):
