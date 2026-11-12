@@ -20,6 +20,7 @@ dependencies = [
     "python-multipart>=0.0.20",
     "sqlalchemy>=2.1.6",
     "uvicorn>=0.54.0",
+    "langchain-postgres>=0.0.19",
 ]
 
 [dependency-groups]

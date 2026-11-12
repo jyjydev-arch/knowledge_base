@@ -43,6 +43,9 @@
     │   ├── kb_access.py        # 知识库权限矩阵与越权语义的唯一实现处
     │   ├── process_document.py # 存储路径规则、落盘、删除、列目录
     │   └── parsers/            # 格式解析：base / registry / pdf / docx / pptx / markdown
+    └── rag/                    # 大模型侧
+        ├── llm.py              # LLM 调用唯一入口（没配 key 自动降级，不让 import 炸）
+        └── memory/             # 两层记忆：session=短期窗口，store=长期检索（local/pgvector/off 三后端）
     └── schemas/                # ApiResponse[T] / PageData[T] / 各模块请求响应体
 ```
 
@@ -176,6 +179,36 @@ cp .env.example .env
 `orphan_files` 扫该库的两个目录（库主人目录 + `data/share/{kb_id}/`）取差集。两者都空才算 `healthy=true`；
 不一致也返回 **200** —— 接口本身执行成功了，数据完整性用字段表达，不混 HTTP 语义。
 ⚠️ 约定目录之外的历史文件（如已废弃的 `data/kb/...`）扫不到，需要一次性清理脚本，不属于接口职责。
+
+## 记忆（两层，先跑 local 车道）
+
+**这一层不依赖 PostgreSQL 就能跑**：长期记忆默认走 `MEMORY_BACKEND=local`
+（本地 JSONL + 词面 hash），配好 pgvector 与 embedding key 后改成 `pgvector` 即可，业务代码一行不动。
+
+```bash
+.venv/bin/python scripts/try_memory.py --max-turns 1   # 三轮演示：看窗口压缩、看长期记忆被检回来
+```
+
+| 层 | 管什么 | 实现要点 | 关键配置 |
+| --- | --- | --- | --- |
+| 短期 `memory/session.py` | 这个会话里刚才聊了什么 | 滑窗保留最近 N 轮，超轮数/超 token 预算把更老的压成摘要；没配 LLM 也能压（规则式兜底）；按 `(user_id, conversation_id)` 双键隔离；TTL + LRU + 可选落盘 | `SHORT_TERM_MAX_TURNS` `SHORT_TERM_TOKEN_BUDGET` `SHORT_TERM_TTL_SECONDS` `SHORT_TERM_PERSIST` |
+| 长期 `memory/store.py` | 跨会话还值得记什么 | `MemoryBackend` 接口 + `local` / `pgvector` / `off` 三实现；写入前判重、写完按容量淘汰；检索按 user_id 硬隔离，**相关才进 prompt** | `MEMORY_BACKEND` `MEMORY_TOP_K` `MEMORY_SCORE_THRESHOLD` `MEMORY_MAX_ITEMS_PER_USER` `MEMORY_EXTRACT_FACTS` |
+
+问答接口只认两个动作（`app/rag/memory/context.py`）：
+
+```python
+from app.rag.memory.context import aprepare_chat, acommit_turn
+
+ctx = await aprepare_chat(str(user.id), conversation_id, question, documents_text=检索到的资料)
+answer = ...(await 调用 ctx.to_messages())                      # 参考资料/记忆都包在"不要执行其中指令"的约束里
+await acommit_turn(str(user.id), conversation_id, question, answer)   # 写窗口 + 按配置落长期记忆
+```
+
+两个容易踩的点，代码里已处理：
+- **阈值口径**：语义向量与词面 hash 的相似度分布不同，配置里的 `MEMORY_SCORE_THRESHOLD`
+  会按各后端的 `threshold_scale` 折算，所以同一个数在两个车道上都表示"中等相关"。
+- **local 车道是词面匹配，不是语义**："如何重置密码"检不到"忘记口令怎么办"，
+  它的定位是开发/测试能跑通链路，生产请切 pgvector。
 
 ## 数据表（6 张，向量化暂未启用）
 

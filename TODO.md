@@ -13,8 +13,9 @@
 | 文档解析（M2 前半） | ✅ 四种格式 + 注册表 + 预览 CLI（`scripts/parse_document.py`），15 条测试 | `app/services/parsers/` |
 | 切块 + 解析入库（M2 后半） | ❌ 未做：解析结果还没接进上传流程，`documents.status` 停在 pending | `app/services/process_document.py`、待建 `chunker.py` |
 | 语义检索 / RAG 问答 | ❌ 未实现。仅有草案：`app/api/v1/aichatrouter.py`（9 条路由全 pass，未 include）、`app/rag/agent.py`（导入期就读到不存在的 settings 字段，会 AttributeError） | 待建 `app/api/v1/searchrouter.py`；`conversations`/`messages` 与 `chat_history` 表按要求后面再建 |
+| 记忆层（M5 前半） | ✅ 短期窗口 + 压缩、长期双后端（local/pgvector）+ 判重与容量淘汰、拼装入口 `context.prepare_chat/commit_turn`，68 条测试；**未接进 aichatrouter（还是 pass）** | `app/rag/memory/`、`app/rag/llm.py`、`scripts/try_memory.py` |
 | 知识库共享授权（read/write） | ✅ `kb_shares` 表 + 3 条路由 + `kb_access` 权限矩阵，6 条文档路由的越权口径已同步改造 | `app/api/v1/kbrouter.py`、`app/services/kb_access.py` |
-| 向量库 | ⏸️ **按要求先不做**：chunks 没有 embedding 列，`init_db.sql` 里的 `CREATE EXTENSION vector` 已注释（本机 PG17 也没装 pgvector） | `app/db/models.py` |
+| 向量库（chunks 的 embedding 列） | ⏸️ **按要求先不做**：`chunks` 还没有 embedding 列，`init_db.sql` 里的 `CREATE EXTENSION vector` 保持注释。※ 顺带更正一条旧结论：本机 PG **是有** pgvector 的（`pg_available_extensions` 里 vector 0.8.7），只是任何库里都没执行过 `CREATE EXTENSION` —— M3 不被环境卡住，卡的是库还没建 | `app/db/models.py` |
 | 数据库迁移 | ⚠️ 无 alembic；已改为「ORM 单一真源」+ `scripts/init_db.py`（建表/重置/检查/生成 SQL 快照） | `scripts/init_db.py` |
 | 后台任务（解析/向量化是慢活） | ❌ 无 | — |
 | 日志 / 限流 / 监控 / Docker / CI | ❌ 无 | — |

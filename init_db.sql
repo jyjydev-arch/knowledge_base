@@ -11,7 +11,8 @@
 --         改过 models.py 后，开发库请 --drop 重建，正式环境等接 alembic（TODO.md P1）。
 -- 注意 2：向量部分还没启用（pgvector 暂不处理）：chunks 表没有 embedding 列；
 --         等向量方案定了再补 CREATE EXTENSION vector / vector(N) 列 / HNSW 索引（TODO.md P0-M3）。
---         本机 PG 17 目前没装 pgvector 扩展，直接跑 CREATE EXTENSION 会报错，所以先注释掉。
+--         ※ 更正：本机 PG 其实有 pgvector（pg_available_extensions 里 vector 0.8.7），
+--           只是目标库里还没 CREATE EXTENSION；等 M3 定维度时打开下面这行即可。
 -- ============================================================
 
 -- CREATE EXTENSION IF NOT EXISTS vector;   -- M3 启用向量化时再打开
