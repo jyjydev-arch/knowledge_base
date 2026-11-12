@@ -1,6 +1,7 @@
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from app.core.config import settings
+from langgraph.store.memory import InMemoryStore
 
 RAG_SYSTEM_PROMPT = """你是一个专业的企业内部的知识库智能问答助手
 
@@ -17,6 +18,12 @@ RAG_SYSTEM_PROMPT = """你是一个专业的企业内部的知识库智能问答
 {question}
 """
 
+#先使用内存存储，后续可以换成向量数据库
+#后续可以使用pgvector进行存储读取以及记忆
+#store = InMemoryStore()
+
+DB_URL = settings.DATABASE_URL
+
 llm = ChatOpenAI(
     model = "deepseek-chat",
     api_key = settings.OPENAI_API_KEY,
@@ -24,6 +31,7 @@ llm = ChatOpenAI(
 )
 
 agent = create_agent(
+    #store = store,
     model = "deepseek:deepseek-flash",
     tools = [],
     system_prompt = RAG_SYSTEM_PROMPT
