@@ -1,6 +1,9 @@
 from fastapi import APIRouter
 
-router = APIRouter(prefix="/api/v1/aichat", tags=["AI Chat"])
+# 版本前缀只在 main.py 出现一次；这里写成 "/api/v1/aichat" 会叠成
+# /api/v1/api/v1/aichat/...（实测过）。路由仍**没有** include 进 app，且下面的处理函数
+# 还是 pass 占位 —— 那部分按要求本轮不动。
+router = APIRouter(prefix="/aichat", tags=["AI Chat"])
 
 # ==========================================
 # 1. 会话管理 (Conversations)
