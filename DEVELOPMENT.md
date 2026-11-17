@@ -99,8 +99,30 @@ async def list_documents(db: DB, user: CurrentUser, page: int = 1, size: int = 2
 ```
 crud 返回 `tuple[Sequence[Model], int]`（数据 + 总数），不要各写各的。
 
-### 3.6 例外：流式接口
-二进制/流式响应（`GET /documents/download/{id}` 的 `FileResponse`、LLM 流式回答 SSE）**不能**套 `ApiResponse` 外层，改为每条事件一行 JSON：`{"status":200,"msg":"chunk","data":{"text":"..."}}`，结束发 `{"status":200,"msg":"done","data":{"references":[...]}}`；并在该路由上设 `response_class=StreamingResponse`、`response_model=None`，避免 FastAPI 试图校验。
+### 3.6 例外：流式接口（SSE）
+
+二进制/流式响应（`GET /documents/download/{id}` 的 `FileResponse`、LLM 流式回答 SSE）**不能**套
+`ApiResponse` 外层。SSE 的帧协议已经在 `app/rag/output/sse.py` 实现，形状是
+**事件名 + 统一载荷**（两个都要，理由写在它的 docstring 里）：
+
+```
+event: token
+id: 7
+data: {"status":200,"msg":"chunk","data":{"text":"你好"}}
+<空行>
+```
+
+- 事件名只有五个，用常量，别手写字符串：`meta` / `token` / `references` / `done` / `error`。
+  前端按事件名分流，靠 `msg` 文案判断类型迟早写错。
+- `data` 内部仍是 `{status,msg,data}` —— 前端那套统一解包代码不用为流式接口开后门。
+- **HTTP 状态码必须保持 200**：`EventSource`/fetch 拿到非 200 会直接断开并进入重连风暴，
+  而不是告诉你哪一步错了。出错走 `error` 帧（`status=500` + `trace_id`）。
+- **异常原文绝不进流**：`str(e)` 里常有 api_key、内网地址、厂商报文。对外只给 `trace_id` + 通用文案。
+- 路由侧：`response_class=StreamingResponse`、`response_model=None`，响应一律用
+  `sse_response(...)` 生成 —— 它已经把 `X-Accel-Buffering: no` 等头设好，漏了这头 nginx 会把
+  整段答案攒完才发（手机端表现是长时间空白后一次性蹦出来）。
+- `id:` 是给断线续传预留的（手机切后台必然打断流）；真正的续传要等 M5 会话落库。
+- 结构化输出与逐字流式**互斥**，别同时用，见 `app/rag/output/struct_response.py`。
 
 ### 3.7 新增接口 checklist
 1. `app/schemas/{module}_schemas.py` 定 `XxxCreate/XxxUpdate/XxxOut`
