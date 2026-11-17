@@ -107,6 +107,15 @@ class Settings(BaseSettings):
     SHORT_TERM_PERSIST: bool = False            # True 时把窗口落 data/memory/sessions/，重启不丢
     SHORT_TERM_USE_TIKTOKEN: bool = False       # 默认用字符启发式：tiktoken 首次要联网下载词表
 
+    # ---------------- 启动检查 / 健康检查 ----------------
+    # 表不齐就不让进程起来（生产/Docker 建议 True）。默认 False：不改现有行为，
+    # 但 /health 会如实返回 503，编排系统和 CI 看得到。
+    DB_STRICT_STARTUP: bool = False
+    # 仅开发用：启动时 metadata.create_all。正式环境应该走迁移（TODO.md P1 的 alembic）
+    AUTO_CREATE_TABLES: bool = False
+    # 探库超时：远端不可达时 TCP 连接会挂在内核重试里，没超时 /health 自己就成故障源
+    HEALTH_CHECK_TIMEOUT_SECONDS: float = 2.0
+
     # ---------------- 跨域 ----------------
     # 逗号分隔，例如 http://localhost:5173,http://127.0.0.1:5173
     CORS_ORIGINS: str = "*"

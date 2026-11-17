@@ -5,6 +5,8 @@
     {"status": <和HTTP一致的码>, "msg": <提示语>, "data": <数据或null>}
 """
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,11 +16,26 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.api.v1.documentrouter import router as document_router
 from app.api.v1.kbrouter import router as kb_router
 from app.api.v1.userrouter import router as user_router
+from app.core import startup
 from app.core.config import settings
 from app.core.exceptions import BusinessError
 from app.schemas.common import ApiResponse
 
+
+async def prepare_schema() -> dict:
+    """启动期检查（单独抽出来，测试才能不打真全局引擎就验到三种策略）"""
+    return await startup.ensure_schema_on_startup()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # 内存库/未配库会在 startup 里短路，所以测试车道（with TestClient）不会因此多连一次库
+    await prepare_schema()
+    yield
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title=settings.APP_NAME,
     description=settings.APP_DESCRIPTION,
     version=settings.APP_VERSION,
@@ -101,6 +118,27 @@ async def root():
     return ApiResponse.ok({"docs": "/docs", "api": settings.API_V1_PREFIX}, msg="AI知识库系统")
 
 
-@app.get("/health", response_model=ApiResponse[dict], summary="健康检查", tags=["Meta"])
+@app.get(
+    "/health",
+    response_model=ApiResponse[dict],
+    summary="健康检查（含数据库探活）",
+    tags=["Meta"],
+)
 async def health():
-    return ApiResponse.ok({"status": "ok", "version": settings.APP_VERSION}, msg="服务正常")
+    """真的连一次库，而不是只报版本号
+
+    状态码必须是 503：Docker healthcheck / k8s readiness / CI 只看状态码，不看 body。
+    响应体只给类别（dialect、缺哪几张表），**不给连接串和异常原文** ——
+    里面含用户名密码和内网地址，`/health` 通常是无需鉴权就能访问的。
+    """
+    code, data = await startup.health_payload()
+    error = (data.get("database") or {}).get("error")
+    if code == 200:
+        return ApiResponse.ok(data, msg="服务正常")
+    if (data.get("database") or {}).get("ephemeral"):
+        return _envelope(code, "服务正常（内存库：测试/临时车道，不代表持久化状态）", data)
+    if error == startup.ERROR_MISSING_TABLES:
+        return _envelope(code, "数据库可连但表不完整：请先运行 python scripts/init_db.py", data)
+    if error == startup.ERROR_NO_METADATA:
+        return _envelope(code, "ORM 元数据为空，检查 app/db/models.py 是否被导入", data)
+    return _envelope(code, "数据库不可用：请检查 DATABASE_URL 与 PostgreSQL 是否在运行", data)

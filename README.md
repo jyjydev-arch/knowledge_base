@@ -73,6 +73,24 @@ cp .env.example .env
 
 接口文档：<http://127.0.0.1:8000/docs>
 
+### 启动检查与 `/health`
+
+应用**自己不会建表**（表结构真源仍是 `app/db/models.py` + `scripts/init_db.py`），所以启动时会检查一次：
+
+| 情形 | 行为 |
+| --- | --- |
+| 表齐 | 日志 INFO，正常启动 |
+| 缺表 / 连不上 | 默认**只告警不阻断**，但 `/health` 返回 **503** 并列出缺哪几张表 |
+| `DB_STRICT_STARTUP=True` | 缺表直接拒绝启动（生产/Docker 建议打开：让编排系统第一时间发现） |
+| `AUTO_CREATE_TABLES=True` | 启动即建表 —— **只给单人开发用**，正式环境该走迁移 |
+| 内存库（测试车道 `:memory:`） | 跳过检查，`/health` 返回 200 并带 `database.ephemeral=true` |
+
+```bash
+curl -s localhost:8000/health | head -c 200      # 探库带超时（HEALTH_CHECK_TIMEOUT_SECONDS，默认 2s）
+```
+`/health` 是免鉴权接口，所以响应里**只有类别信息**（方言、缺表清单、错误类型），
+连接串、用户名密码、异常原文一律只进日志。
+
 ## 统一返回格式
 
 所有接口（**包括报错**）都返回 `{"status": ..., "msg": ..., "data": ...}`，
