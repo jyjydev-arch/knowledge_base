@@ -30,7 +30,7 @@ import asyncio
 import json
 import logging
 import uuid as uuid_lib
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any
 
 from fastapi.responses import StreamingResponse
@@ -140,12 +140,20 @@ async def stream_chat_tokens(
     meta: Mapping[str, Any] | None = None,
     references: Sequence[Mapping[str, Any]] | None = None,
     heartbeat_seconds: float = 0,
+    on_text: Callable[[str], Any] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> AsyncIterator[str]:
     """逐字流式：**chat model 路径**（不接 stream_mode，也不接 agent）
 
     典型用法（M5 的对话路由）：先检索 → 参考资料塞进 messages → 这个函数边生成边发，
     最后一帧把引用列表发给前端点回原文。
+
+    两个钩子是为 M5 的 /stop 与落库加的（协议本身没变）：
+      - on_text: 每生成一段文本回调一次。调用方要拿全文落库，不能等流结束后再把发出去的帧拼回来；
+      - should_stop: 每次取下一个 chunk 前问一次。返回 True 就正常收尾发 done 帧，而不是抛取消异常 ——
+        半截答案要能落库，前端也要收到一个明确的结束帧。
     """
+    agen: Any = None  # 提前 break（被 /stop）时要在 finally 里显式关掉，见函数末尾
     framer = _Framer()
     payload = envelope(200, "start", dict(meta or {}))
     yield framer.frame(EVENT_META, payload)
@@ -153,6 +161,7 @@ async def stream_chat_tokens(
     chat_messages = to_chat_messages(messages)
     collected: list[str] = []
     pending: asyncio.Future | None = None
+    agen: Any = None
     try:
         agen = model.astream(chat_messages).__aiter__()  # 注意：这里不传 stream_mode
         while True:
@@ -170,10 +179,14 @@ async def stream_chat_tokens(
                 continue
             except StopAsyncIteration:
                 break  # 正常读完；StopAsyncIteration 绝不能往生成器外抛，否则变 RuntimeError
+            if should_stop is not None and should_stop():
+                break  # 正常收尾：下面照常发 references / done
             pending = None
             text = _chunk_text(chunk)
             if text:
                 collected.append(text)
+                if on_text is not None:
+                    on_text(text)
                 yield framer.frame(EVENT_TOKEN, envelope(200, "chunk", {"text": text}))
 
         if references:
@@ -194,6 +207,10 @@ async def stream_chat_tokens(
         # 客户端中途断开：把还在跑的读取 task 收掉，别留孤儿
         if pending is not None and not pending.done():
             pending.cancel()
+        if agen is not None:
+            # 被 should_stop 提前 break 时模型流还开着；交给 GC 关闭会变成
+            # "async generator ignored GeneratorExit" 这类噪声，手机上尤其明显（切后台=常态）
+            await agen.aclose()
 
 
 def _chunk_text(chunk: Any) -> str:

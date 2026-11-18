@@ -11,8 +11,7 @@
 --         改过 models.py 后，开发库请 --drop 重建，正式环境等接 alembic（TODO.md P1）。
 -- 注意 2：向量部分还没启用（pgvector 暂不处理）：chunks 表没有 embedding 列；
 --         等向量方案定了再补 CREATE EXTENSION vector / vector(N) 列 / HNSW 索引（TODO.md P0-M3）。
---         ※ 更正：本机 PG 其实有 pgvector（pg_available_extensions 里 vector 0.8.7），
---           只是目标库里还没 CREATE EXTENSION；等 M3 定维度时打开下面这行即可。
+--         本机 PG 17 目前没装 pgvector 扩展，直接跑 CREATE EXTENSION 会报错，所以先注释掉。
 -- ============================================================
 
 -- CREATE EXTENSION IF NOT EXISTS vector;   -- M3 启用向量化时再打开
@@ -79,6 +78,25 @@ CREATE INDEX IF NOT EXISTS ix_tokens_expires ON tokens (expires_at);
 
 CREATE INDEX IF NOT EXISTS ix_tokens_user_expires ON tokens (user_id, expires_at);
 
+CREATE TABLE IF NOT EXISTS chat_sessions (
+	id UUID NOT NULL, 
+	user_id UUID NOT NULL, 
+	kb_id UUID, 
+	title VARCHAR(255) DEFAULT '新对话' NOT NULL, 
+	summary TEXT DEFAULT '' NOT NULL, 
+	summary_seq INTEGER DEFAULT 0 NOT NULL, 
+	message_count INTEGER DEFAULT 0 NOT NULL, 
+	token_count INTEGER DEFAULT 0 NOT NULL, 
+	last_message_at TIMESTAMP WITH TIME ZONE, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	updated_at TIMESTAMP WITH TIME ZONE, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE, 
+	FOREIGN KEY(kb_id) REFERENCES knowledge_bases (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_chat_session_user_last ON chat_sessions (user_id, last_message_at);
+
 CREATE TABLE IF NOT EXISTS documents (
 	id UUID NOT NULL, 
 	kb_id UUID NOT NULL, 
@@ -102,9 +120,9 @@ CREATE TABLE IF NOT EXISTS documents (
 	FOREIGN KEY(owner_id) REFERENCES users (id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS ix_document_kb_created ON documents (kb_id, created_at);
-
 CREATE INDEX IF NOT EXISTS ix_document_owner_status ON documents (owner_id, status);
+
+CREATE INDEX IF NOT EXISTS ix_document_kb_created ON documents (kb_id, created_at);
 
 CREATE TABLE IF NOT EXISTS kb_shares (
 	id UUID NOT NULL, 
@@ -122,6 +140,24 @@ CREATE TABLE IF NOT EXISTS kb_shares (
 );
 
 CREATE INDEX IF NOT EXISTS ix_kb_share_grantee ON kb_shares (grantee_id);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+	id UUID NOT NULL, 
+	session_id UUID NOT NULL, 
+	user_id UUID NOT NULL, 
+	role VARCHAR(16) DEFAULT 'user' NOT NULL, 
+	content TEXT NOT NULL, 
+	token_count INTEGER DEFAULT 0 NOT NULL, 
+	seq INTEGER NOT NULL, 
+	sources JSONB DEFAULT '[]' NOT NULL, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	PRIMARY KEY (id), 
+	CONSTRAINT uq_chat_message_session_seq UNIQUE (session_id, seq), 
+	FOREIGN KEY(session_id) REFERENCES chat_sessions (id) ON DELETE CASCADE, 
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS ix_chat_message_session_created ON chat_messages (session_id, created_at);
 
 CREATE TABLE IF NOT EXISTS chunks (
 	id UUID NOT NULL, 
@@ -142,8 +178,8 @@ CREATE TABLE IF NOT EXISTS chunks (
 	FOREIGN KEY(owner_id) REFERENCES users (id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS ix_chunk_kb ON chunks (kb_id);
-
 CREATE INDEX IF NOT EXISTS ix_chunk_owner_kb ON chunks (owner_id, kb_id);
+
+CREATE INDEX IF NOT EXISTS ix_chunk_kb ON chunks (kb_id);
 
 COMMIT;

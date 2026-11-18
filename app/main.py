@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.api.v1.aichatrouter import router as aichat_router
 from app.api.v1.documentrouter import router as document_router
 from app.api.v1.kbrouter import router as kb_router
 from app.api.v1.userrouter import router as user_router
@@ -111,6 +112,7 @@ async def unhandled_error_handler(request: Request, exc: Exception):
 app.include_router(user_router, prefix=settings.API_V1_PREFIX)
 app.include_router(document_router, prefix=settings.API_V1_PREFIX)
 app.include_router(kb_router, prefix=settings.API_V1_PREFIX)
+app.include_router(aichat_router, prefix=settings.API_V1_PREFIX)
 
 
 @app.get("/", response_model=ApiResponse[dict], summary="根路径", tags=["Meta"])

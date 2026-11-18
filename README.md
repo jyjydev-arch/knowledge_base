@@ -17,7 +17,9 @@
 ├── start.sh                    # 启动脚本（uvicorn app.main:app --reload）
 ├── scripts/
 │   ├── init_db.py              # 建表 / --drop 重置 / --check / --snapshot 生成 SQL
-│   └── parse_document.py       # 解析预览 CLI：看一个文件被切成哪些块（M2 排错用）
+│   ├── parse_document.py       # 解析预览 CLI：看一个文件被切成哪些块（M2 排错用）
+│   ├── index_documents.py      # 文档向量化入库 CLI（pgvector 车道，按 document_id 幂等）
+│   └── try_memory.py           # 记忆层自检 CLI（不建库不联网也能跑）
 ├── tests/                      # 接口测试 + 表结构测试
 ├── frontend/
 ├── data/                      # 知识库数据（文件、图片、视频、音频、文档、模型等）
@@ -28,7 +30,8 @@
     │   └── v1/
     │       ├── userrouter.py       # 用户路由
     │       ├── kbrouter.py         # 知识库授权路由（share / revoke / list）
-    │       └── documentrouter.py   # 文档路由
+    │       ├── documentrouter.py   # 文档路由（上传/列表/详情/下载/删除/状态）
+    │       └── aichatrouter.py     # 对话路由（会话 CRUD + SSE 问答 + 停止 + agent 目录）
     ├── core/
     │   ├── config.py           # .env 配置
     │   ├── security.py         # 密码哈希 + JWT 签发/解析
@@ -41,10 +44,18 @@
     │   └── crud/               # 数据访问层（只读写库，不抛 HTTP 异常）
     ├── services/               # 业务算法层
     │   ├── kb_access.py        # 知识库权限矩阵与越权语义的唯一实现处
-    │   ├── process_document.py # 存储路径规则、落盘、删除、列目录
+    │   ├── process_document.py # 存储路径规则、落盘、删除、解析→切块→入库编排
+    │   ├── chunker.py          # 切块纯函数：按 heading 分组 + 滑窗（长度取 kb.chunk_size）
+    │   ├── vector_index.py     # 把 chunks 向量化写入 pgvector（按 document_id 幂等）
+    │   ├── text_metrics.py     # token 估算（切块与短期窗口共用一份口径）
     │   └── parsers/            # 格式解析：base / registry / pdf / docx / pptx / markdown
     └── rag/                    # 大模型侧
         ├── llm.py              # LLM 调用唯一入口（没配 key 自动降级，不让 import 炸）
+        ├── chat.py             # 会话**存取**层：chat_sessions/chat_messages 是唯一存储
+        ├── answer.py           # 一轮问答的**编排**：范围→检索→上下文→模型→落库（流式/一次性两条车道）
+        ├── retrieval.py        # 检索层（M4 第一版：关键词召回 + 词频算分，形状与向量版一致）
+        ├── generation.py       # 在跑的生成注册表（/stop 靠它；进程内，多 worker 有局限）
+        ├── output/             # SSE 分帧 + 结构化输出（逐字流式与结构化输出互斥）
         └── memory/             # 两层记忆：session=短期窗口，store=长期检索（local/pgvector/off 三后端）
     └── schemas/                # ApiResponse[T] / PageData[T] / 各模块请求响应体
 ```
@@ -162,6 +173,12 @@ curl -s localhost:8000/health | head -c 200      # 探库带超时（HEALTH_CHEC
 
 文档 6 条路由已全部实现（`NotImplementedFeatureError` → 501 保留给以后新增接口占位用）。
 
+上传之后**解析/切块是异步的**：接口立刻返回 `status=pending`，后台任务把状态推到
+`indexed` 或 `failed`（失败原因在 `error_msg`），前端轮询 `GET /documents/status` 就行。
+想关掉自动索引（比如以后换成 worker）就设 `DOCUMENT_INDEX_ON_UPLOAD=False`；
+手动重跑用 `scripts/index_documents.py` 或将来补的 reindex 接口，重跑**幂等**
+（切块按 document_id 先删后插，向量同理），不会越跑越多。
+
 支持上传的格式由解析器注册表决定：**`pdf / docx / pptx / md / txt`**，
 加一种格式只要在 `app/services/parsers/registry.py` 登记，上传接口自动放行（有测试锁这条一致性）。
 解析目前做到「能读、能预览」，还没接进上传后的自动流程（`documents.status` 停在 `pending`）：
@@ -198,6 +215,62 @@ curl -s localhost:8000/health | head -c 200      # 探库带超时（HEALTH_CHEC
 不一致也返回 **200** —— 接口本身执行成功了，数据完整性用字段表达，不混 HTTP 语义。
 ⚠️ 约定目录之外的历史文件（如已废弃的 `data/kb/...`）扫不到，需要一次性清理脚本，不属于接口职责。
 
+### 对话 `/aichat`（8 条，已接入）
+
+| 方法 | 路径 | 说明 | data |
+| --- | --- | --- | --- |
+| POST | `/conversations` | 新建会话；`kb_id` 可把问答范围限定在某个库（必须你读得到，否则 404） | 会话信息 |
+| GET | `/conversations` | 会话列表，按**最后发言时间**倒序，支持 `keyword` 标题搜索与分页 | 分页数据 |
+| PUT | `/conversations/{conversation_id}` | 重命名（别人的会话 404） | 会话信息 |
+| DELETE | `/conversations/{conversation_id}` | 删除会话，消息外键级联；会先取消该会话在跑的生成 | null |
+| GET | `/conversations/{conversation_id}/messages` | 历史消息，按 seq 升序 + `before_seq` 游标翻页 | 会话 + 消息页 |
+| POST | `/conversations/{conversation_id}/chat` | 一轮问答：默认 SSE 逐字流；`stream=false` 一次性 JSON | 流 / 回答体 |
+| POST | `/conversations/{conversation_id}/stop` | 停止生成，**保留已生成的半截答案**并正常收尾 | 停止结果 |
+| GET | `/agents` | 可选 agent 目录 + 当前配置下能不能用（M8 前是配置常量） | agent 列表 |
+
+问答这条链路的四个要点：
+
+1. **检索范围来自权限，不来自请求体**。会话限定了 `kb_id` 就只查那个库（授权被收回后查不到，
+   但历史消息保留）；没限定则在「你读得到的全部库」里查（自己的 + 被共享的 + public）。
+   没有「查全库」这种默认值 —— 越权是这类系统最常见的洞。
+2. **检索目前是关键词车道**（`app/rag/retrieval.py`：DB 里 LIKE 召回 + 词频算分 + 每篇文档限流 2 块）。
+   embedding 厂商与维度还没定，所以先不上向量；返回形状（`text` + `sources` + `mode`）按向量版定，
+   换实现时路由和前端一行都不用动。`mode` 会如实说明为什么没资料：
+   `keyword`（命中）/ `none`（没命中）/ `no_scope`（没有可读库）/ `disabled`（开关关了）。
+3. **流式的错误分两段**。推流之前（会话不存在、模型没配置、该会话已有回答在生成）走正常 HTTP 状态码；
+   推流之后只能 200 + `error` 帧，异常原文进日志、对外只给 `trace_id`。
+4. **收尾落库用新开的 Session**（依赖 `get_session_factory`）：SSE 生成器活得比请求函数久，
+   而且不该让一条数据库连接陪跑几十秒的模型流。
+
+```bash
+CID=$(curl -s -X POST $API/api/v1/aichat/conversations -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"title":"报销咨询"}' | jq -r .data.id)
+
+# 流式：-N 关掉 curl 的缓冲，否则看起来像"一次性蹦出来"
+curl -N -X POST $API/api/v1/aichat/conversations/$CID/chat \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"question":"报销流程是什么","stream":true,"top_k":4}'
+
+# 不要 SSE 的时候（脚本 / CI 冒烟 / 手机端兜底）
+curl -s -X POST $API/api/v1/aichat/conversations/$CID/chat \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"question":"报销流程是什么","stream":false}'
+```
+
+SSE 的帧（协议细节见 DEVELOPMENT §3.6）：
+
+```
+event: meta         {"status":200,"msg":"start","data":{"session_id":...,"retrieval":{"mode":"keyword","hits":1}}}
+event: token        {"status":200,"msg":"chunk","data":{"text":"报销"}}
+event: references   {"status":200,"msg":"references","data":{"items":[{"index":1,"document_id":...,"page":3}]}}
+event: done         {"status":200,"msg":"done","data":{"text":"全文"}}
+event: error        {"status":500,"msg":"生成中断，请重试","data":{"trace_id":"a1b2c3d4","retryable":true}}
+```
+
+> ⚠️ `/stop` 靠进程内注册表：多 worker 部署时 stop 请求必须落到同一个进程才生效（排期见 TODO M9）。
+
+---
+
 ## 记忆（两层，先跑 local 车道）
 
 **这一层不依赖 PostgreSQL 就能跑**：长期记忆默认走 `MEMORY_BACKEND=local`
@@ -228,7 +301,7 @@ await acommit_turn(str(user.id), conversation_id, question, answer)   # 写窗�
 - **local 车道是词面匹配，不是语义**："如何重置密码"检不到"忘记口令怎么办"，
   它的定位是开发/测试能跑通链路，生产请切 pgvector。
 
-## 数据表（6 张，向量化暂未启用）
+## 数据表（8 张）
 
 ```
 users            账号：role(user/admin) / is_active / last_login_at / deleted_at
@@ -242,10 +315,23 @@ chunks           切块：document_id/kb_id/owner_id + seq + content + token_cou
                  ※ 还没有 embedding 向量列，等 pgvector 方案定了再补（当前确认先不做）
 ```
 
-`chat_history`（会话/消息表）按约定后面再建，见 TODO.md P0-M5。
+```
+chat_sessions      会话头：user_id + kb_id(可空，删库置 NULL) + title + summary + summary_seq + 计数
+chat_messages      消息：session_id(级联删) + user_id(冗余，鉴权只认它) + role + content + seq + token_count + sources
+```
+
+两张会话表现在被三处用到：`app/rag/chat.py`（存取）、`app/rag/answer.py`（一轮问答的编排）、`app/api/v1/aichatrouter.py`（8 条路由，已 include）。对话页可以直接联调。
+`summary_seq` 是**摘要水位线**：`seq <= summary_seq` 的消息已经折进 `summary` 了，
+下次压缩从这条线之后开始 —— 没有它，同一段对话会被反复折叠、摘要越滚越长。
 
 ## 测试
 
 ```bash
 .venv/bin/python -m pytest      # 用临时 SQLite 跑完整流程，不依赖 PostgreSQL
 ```
+
+当前 **321 passed / 11 文件**：33 用户 · 48 文档 · 33 对话接口 · 28 会话服务 · 25 切块入库 · 18 共享授权 · 15 解析 · 68 记忆 · 27 输出 · 20 启动健康 · 6 表结构。
+
+对话接口的测试**不出网**：模型只从 `answer.get_answer_model()` 取，测试把它换成假模型，于是 SSE 分帧、消息转换、检索、落库都是真链路；长期记忆换成 `NullBackend`，避免测试往 `data/memory/` 写文件。
+
+> 仍然**没有真 PG 跑通过的证据**：全部用例都是临时 SQLite，`chat_messages` 的级联删除靠 `PRAGMA foreign_keys=ON` 模拟。建库那步别省（TODO 的 M-环境）。

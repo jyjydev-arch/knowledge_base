@@ -58,9 +58,7 @@ def build_embeddings():
     return OpenAIEmbeddings(**kwargs)
 
 
-@lru_cache(maxsize=1)
-def get_vectorstore():
-    """全局单例。首次调用才会真的连库建表，所以不要在 import 阶段碰它"""
+def _build_vectorstore(collection_name: str):
     from langchain_postgres import PGVector
     from langchain_postgres.vectorstores import DistanceStrategy
 
@@ -72,15 +70,31 @@ def get_vectorstore():
     return PGVector(
         embeddings=build_embeddings(),
         connection=_to_psycopg_dsn(settings.DATABASE_URL),
-        collection_name=settings.MEMORY_PG_COLLECTION,
+        collection_name=collection_name,
         distance_strategy=DistanceStrategy.COSINE,
         embedding_length=settings.EMBEDDING_DIMS,
-        use_jsonb=True,        # metadata 存 JSONB，user_id 过滤才走得动
+        use_jsonb=True,        # metadata 存 JSONB，user_id/document_id 过滤才走得动
         create_extension=True,  # 首次用时顺手 CREATE EXTENSION vector（需要账号有权限）
-        echo=False,
     )
+
+
+@lru_cache(maxsize=1)
+def get_vectorstore():
+    """长期记忆用的 collection（全局单例，首次调用才连库建表）"""
+    return _build_vectorstore(settings.MEMORY_PG_COLLECTION)
+
+
+@lru_cache(maxsize=1)
+def get_document_vectorstore():
+    """知识库文档向量用的 collection —— **必须和记忆分开**
+
+    混在一个 collection 里，检索时"用户记忆"和"文档片段"会互相命中，
+    而且清理某个文档的向量会把记忆条目一起带走。分开之后两边都能独立重建。
+    """
+    return _build_vectorstore(settings.DOCUMENT_VECTOR_COLLECTION)
 
 
 def reset_vectorstore_cache() -> None:
     """换配置 / 跑测试后用一次，否则旧的单例会带着上一条连接的池子继续用"""
     get_vectorstore.cache_clear()
+    get_document_vectorstore.cache_clear()

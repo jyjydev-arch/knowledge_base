@@ -7,7 +7,7 @@
 
 ---
 
-## 0. 进度快照（2026-11-17 实测，不是回忆）
+## 0. 进度快照（2026-11-18 实测，不是回忆）
 
 | 模块 | 状态 | 证据 / 代码位置 |
 | --- | --- | --- |
@@ -17,32 +17,33 @@
 | **知识库 CRUD** | ❌ **只有 3 条 `/kb/share`，`POST /kb`、`GET /kb/list`、`detail`、`update`、`DELETE` 全没做** | `app/api/v1/kbrouter.py` ← **当前最卡脖子** |
 | 文档 | ✅ 6 条全实现（upload/list/detail/status/delete/download），48 条测试 | `app/api/v1/documentrouter.py` |
 | 共享授权 | ✅ 3 条路由 + `kb_access` 权限矩阵，18 条测试 | `app/api/v1/kbrouter.py`、`app/services/kb_access.py` |
-| 表结构 | ✅ 6 张表，6 条结构测试（列/索引/约束） | `app/db/models.py`、`tests/test_schema_models.py` |
+| 表结构 | ✅ **8 张表**（新增 chat_sessions / chat_messages），`init_db.sql` 快照已同步 | `app/db/models.py`、`scripts/init_db.py --snapshot` |
 | 格式解析 | ✅ pdf/docx/pptx/md/txt + 注册表 + 预览 CLI（15 条测试） | `app/services/parsers/` |
-| **切块与入库** | ❌ **解析结果不在任何请求路径上**：`registry.parse_file` 零调用、`chunks` 表只读不写、`update_status` 无调用方 → `documents.status` 永远 `pending` | `app/services/process_document.py`，待建 `chunker.py` |
-| 向量化 | ⏸️ 按要求仍暂缓。※更正一条旧结论：本机 PG **装了** pgvector（0.8.7），只是任何库里都没 `CREATE EXTENSION` | `chunks` 无 embedding 列 |
-| 检索 | ❌ 0（连"先用全文兜底"的版本都没有） | 待建 `app/services/retriever.py` |
-| 问答 / 会话 | ❌ `aichatrouter.py` 8 条**全是 `pass`**、`prefix` 有双前缀坑、**没 include 进 app**；`chat_sessions/chat_messages` 表未建 | `app/api/v1/aichatrouter.py` |
+| **切块与入库** ✅ | ✅ `chunker.py`（纯函数）+ `process_document()` 编排 + `/upload` 已调度后台任务；`status` 真流转 `pending→parsing→chunking→indexed/failed`，重跑幂等（先删后插） | 25 条测试：`tests/test_document_index.py` |
+| 向量化 ⚠️ | ⚠️ **代码已就绪但一次都没连库跑过**：`app/services/vector_index.py` + `scripts/index_documents.py`；文档向量与记忆向量分 collection，metadata 必带 user_id/kb_id/document_id/chunk_id，按 document_id 幂等重建 | 待办：PG 建库 + 定 embedding 模型/维度 |
+| 检索 ✅ | ✅ **M4 的第一版（关键词车道）已实现**：LIKE 召回 + 词频算分 + 每篇文档限流 2 块 + 总长预算；范围只认权限（会话的库或全部可读库），软删文档的块不参与 | `app/rag/retrieval.py`、`chunk_crud.search_chunks` |
+| 会话存储与服务 ✅ | ✅ 两张表 + `chat_crud` + `app/rag/chat.py`（new/get/list/rename/delete/history/load_context/record_turn）；摘要带**水位线**不会重复折叠；28 条测试 | `app/rag/chat.py`、`app/db/crud/chat_crud.py` |
+| 对话路由 ✅ | ✅ **8 条全部实现并 include**：会话 4 条 + 历史消息 + 问答（SSE/JSON 两条车道）+ 停止 + agent 目录；33 条接口测试 | `app/api/v1/aichatrouter.py`、`app/rag/answer.py` |
 | 记忆（两层） | ✅ 短期窗口+压缩、长期 local/pgvector 双后端、判重与容量淘汰、68 条测试 | `app/rag/memory/`、`app/rag/llm.py` |
-| 输出层（流式 + 结构化） | ✅ `app/rag/output/sse.py` 五类事件帧 + `struct_response.py` 输出契约，27 条测试；`agent.py` 已改成懒构造 `build_agent()` | 同样**没接线**：对话路由还没实现 |
-| 记忆接线 | ❌ **没人调用**：问答路由没实现，`prepare_chat/commit_turn` 是空挂的功能 | `app/rag/memory/context.py` |
+| 输出层（流式 + 结构化） | ✅ 五类事件帧 + 输出契约 + 懒构造 `build_agent()`；`stream_chat_tokens()` 这轮加了 `on_text` / `should_stop` 两个钩子给 /stop 与落库用 | **已接进 `POST /aichat/conversations/{id}/chat`**；结构化输出（agent 车道）留给 M8 |
+| 记忆接线 ✅ | ✅ 问答链路里两层记忆都在真用：`load_context` 取长期记忆 + 摘要水位线后的窗口，`record_turn` 按配置回写长期记忆；同步阻塞的记忆调用已挪进 `run_in_threadpool` | `app/rag/chat.py`、`app/rag/answer.py` |
 | 前端 | ❌ 还是 vite 初始模板：`src/` 只有 `App.vue`+`main.ts`，依赖只有 `vue` | `frontend/` |
 | **PostgreSQL** | ❌ **项目从没在 PG 上跑起来过一次**：`.env` 里 postgres 密码错（真实密码在 `~/.pgpass`），且 `knowledge_base` 库不存在 | `scripts/init_db.py --check` 认证失败 |
-| 占位路由 ⚠️ | ❌ **实测：8 条 `pass` 的路由返回 `200 + null`，不是 501**。前端会当成功、解包 `data` 时炸（`None` 上取 `.items`）——必须改成 `raise NotImplementedFeatureError` | `app/api/v1/aichatrouter.py` |
-| 双前缀 ✅ | ✅ 已修为 `prefix="/aichat"`，并加了防呆测试（router 前缀不许含 `/api`；openapi 路径里不许出现 `/api/v1/api`；aichat 未 include 也一起钉） | `app/api/v1/aichatrouter.py`、`tests/test_startup_health.py` |
+| 占位路由 ✅ | ✅ 已消灭：`pass` 版本实测返回 `200 + null`（前端解包必炸），现在 8 条都有真实实现与统一返回体 | `app/api/v1/aichatrouter.py` |
+| 双前缀 ✅ | ✅ 已修为 `prefix="/aichat"`，并加了防呆测试（router 前缀不许含 `/api`；openapi 路径里不许出现 `/api/v1/api`；aichat 接入后新增一条：8 条路径必须出现在 `/api/v1/aichat` 下且数量正好 8） | `app/api/v1/aichatrouter.py`、`tests/test_startup_health.py` |
 | 健康检查 ✅ | ✅ `/health` 现在真连一次库：缺表/连不上 → **503** + 缺表清单，探库带超时（默认 2s）；响应只给类别，不含连接串与异常原文 | `app/core/startup.py`、`app/main.py` |
 | 建表 ✅ | ✅ 加了 lifespan 启动检查（`app/core/startup.py`）：默认**告警不阻断**，`DB_STRICT_STARTUP=True` 直接拒绝启动，`AUTO_CREATE_TABLES=True` 启动即建表（仅开发）。内存库跳过，测试车道不受影响 | `app/core/startup.py`、`tests/test_startup_health.py`（20 条） |
-| 测试 | ✅ **235 passed**（8 文件），但**全部走临时 SQLite** | 构成：33 用户 / 48 文档 / 18 共享授权 / 15 解析 / 68 记忆 / 27 输出 / 20 启动健康 / 6 表结构 |
-| 路由总数 | 17 条已实现（+ aichat 8 条占位不计） | `GET /openapi.json` |
+| 测试 | ✅ **321 passed**（11 文件），仍**全部走临时 SQLite**；对话测试用假模型 + `NullBackend`，不出网也不写盘 | 构成：33 用户 / 48 文档 / **33 对话接口** / 28 会话服务 / 25 切块入库 / 18 共享授权 / 15 解析 / 68 记忆 / 27 输出 / 20 启动健康 / 6 表结构 |
+| 路由总数 | **25 条已实现**（用户 8 + 文档 6 + 授权 3 + 对话 8） | `GET /openapi.json` |
 
-一句话：**骨架很齐，主线是断的**。断点在两处：知识库接口（拿不到 `kb_id`）和切块入库（`chunks` 是空的）。
-这两处不补，前端只能做登录页，agent 只能凭空聊 —— 手机这条路根本走不通。
+一句话：**主线已经通了，只剩一个断点**。切块入库、会话落库、问答链路（检索→prompt→流式→落库）都接上了；
+还卡着的是 **M0 知识库 CRUD**：没有 HTTP 途径能建库，`/documents/upload` 和 `chat` 的 `kb_id` 都无来源
+（现在只能靠脚本建库联调）。
 
-**工作区有一批未提交改动**（235 passed，我自己的文件 ruff 干净；老代码基线还有约 18 个 lint 问题没动）：
-新增 `app/core/startup.py`、`app/rag/output/`、`tests/test_rag_output.py`、`tests/test_startup_health.py`；
-修改 `app/main.py`、`app/core/config.py`、`app/api/v1/aichatrouter.py`（只改 prefix）、`app/rag/agent.py`、
-`.env.example`、`README.md`、`DEVELOPMENT.md`、`TODO.md`。**建议先提交再开 M0**，
-否则后面 diff 会越堆越厚、拆不开。
+**本轮（对话路由接线 + 检索车道 + 停止生成）新增**：`app/rag/{answer,retrieval,generation}.py`、
+`app/schemas/chat_schemas.py`、`tests/test_chat_api.py`（33 条）；`chunk_crud` 加 `search_chunks`；
+`deps.py` 加 `get_session_factory`（流式收尾用）；`aichatrouter.py` 8 条实现并在 `main.py` include；
+`config.py` 加 6 个 `CHAT_*` 开关；`chat.py` 把阻塞的记忆/压缩调用挪进线程池。321 passed，我写的文件 ruff 干净。
 
 ---
 
@@ -106,38 +107,44 @@ WebView 路线有两个做法，差别不是"要不要 WebView"，而是**那几
 
 ### M2 后半 切块与入库（1 天）——**agent 有没有凭据就看这里**
 
-- [ ] `app/services/chunker.py`：按 `heading` 分组 → 组内滑窗（`kb.chunk_size/chunk_overlap`），块继承 `page/heading/extra`；**纯函数，先写单测再落库**
-- [ ] `process_document(document_id)` 编排：`registry.parse_file` → `chunker` → 批量写 `chunks` → 更新 `status/chunk_count/token_count`
-- [ ] `status` 流转真跑起来：`pending → parsing → chunking → indexed / failed` + `error_msg`
-- [ ] 重索引**幂等**：先按 `document_id` 删旧块再插（重复入库结果必须一样）
-- [ ] 后台执行先上 FastAPI `BackgroundTasks`（`/upload` 里预留的 `background_tasks` 参数就是给它用的）→ 量大再 `arq`/`celery`
+- [x] ~~chunker~~ ✅ `app/services/chunker.py`：按 (heading, page) 分组 → 组内滑窗，长度取 `kb.chunk_size/chunk_overlap`；
+      `overlap >= chunk_size` 自动收敛（否则窗口不前进 = 死循环）；断点优先落句读，尾巴过短并进上一块
+- [x] ~~编排~~ ✅ `process_document(document_id, session=None)`：路径校验 → `registry.parse_file`（线程池）→ 切块 → `chunk_crud.replace_document_chunks` → 状态与计数
+- [x] ~~status 流转~~ ✅ `pending → parsing → chunking → indexed / failed`，失败原因进 `error_msg`（空文档提示"可能是扫描件，需要 OCR"）
+- [x] ~~幂等重索引~~ ✅ crud 只有 `replace_*`（先删后插），没有"追加"口子；`force=False` 跳过已 indexed 的
+- [x] ~~后台执行~~ ✅ `/upload` 用掉了预留的 `background_tasks`；新增开关 `DOCUMENT_INDEX_ON_UPLOAD`（默认 True，测试车道 False）
+- [ ] **`failed` 的文档现在没有重跑入口**：要么暴露 `POST /documents/reindex/{id}`，要么让 `/upload` 撞重复文件时把旧文档重新索引
+- [ ] 后台任务的可观测性：进程内任务崩了只能靠日志；重启时留在 `parsing/chunking` 的文档没人捡（worker 化时一起做）
 - [ ] OCR（扫描件）与老 `.doc/.ppt` 预转：优先级看实际资料构成，P2
 - 验收：上传一篇 10 页 PDF，`SELECT count(*) FROM chunks` 有数据、`status=indexed`、`/detail` 能出真实块
 
-### M3 向量化 ⏸️ 仍按你的要求暂缓（备忘）
+### M3 向量化 ⚠️ 代码已写好，卡在两件外部事：PG 库 + embedding 模型/维度
 
 - 到时候：`chunks.embedding vector(N)` + HNSW；`app/services/embedding.py` 走 API 方案
   （`EMBEDDING_BASE_URL/API_KEY/MODEL/DIMS` 已存在于配置里）；**维度一旦定了不能改**，换模型要连维度带 collection 一起换
 - 长期记忆的 pgvector 车道用的是同一套依赖，M3 做完顺手把 `MEMORY_BACKEND=pgvector` 打开即可
 
-### M4 检索（1 天）——**先用全文兜底，不等向量化**
+### M4 检索 ⚠️ 半程（关键词车道已上线，向量车道等 M3）
 
 手机 agent 不需要"最准"，需要"今天就能问出带来源的答案"。所以分两步：
-- [ ] **第一版全文检索**：PG `websearch_to_tsquery`/`tsvector`（中文没接分词器就先用 `ILIKE` + 关键词扩展），照样带 `user_id/kb_id` 过滤，接口形状与向量版**完全一致**
-- [ ] `app/services/retriever.py` + `POST /search`：`{query, kb_id?, top_k, min_score}` → `data.items[{chunk_id,document_id,content,score,page,heading}]`
-- [ ] ⚠️ **越权是这类系统最常见的洞**：任何检索必须带用户过滤，并把"跨用户搜不到"写成一条测试
+- [x] ~~第一版全文检索~~ ✅ `app/rag/retrieval.py`：中文按「整段 + 2-gram」造词（没分词器时段落级 ILIKE 必然 0 命中）、`chunk_crud.search_chunks` 做 LIKE 召回（转义 `%`/`_`、JOIN documents 滤软删）、词频算分、每篇文档限流 2 块、总长预算 `CHAT_RETRIEVAL_MAX_CHARS`。没用 `websearch_to_tsquery` 是要同时兼容测试车道的 SQLite，PG 全文等向量车道一起上
+- [ ] 独立的 `POST /search` 还没做（前端要做"纯搜索框"时再加）。文件落点是 `app/rag/retrieval.py` 而不是 `app/services/retriever.py`：按 §2 的分工，检索属模型侧，`services/` 只放切块/解析这类业务算法
+- [x] ~~越权过滤~~ ✅ 范围只认权限（会话的库 → 授权校验；没限定 → `accessible_kb_ids`），空范围=查不到而不是查全库；测试钉住：`test_问答_检索不越权_共享之后才能查到`、`test_问答_被软删文档的块不参与检索`、`test_新建会话_不能圈别人的库`
 - [ ] 第二版把 SQL 换成向量 `<=>`，上层零改动（M3 时做）
-- 验收：问一句能召回正确段落；B 搜不到 A 的内容
+- 验收：✅ 已过（关键词车道，33 条接口测试里有 5 条直接打在检索上）。B 搜不到 A 的内容是**硬要求**，向量版上线时这几条测试一行都不许改
 
-### M5 问答 + 会话（1.5 天）——**记忆在这里接线**
+### M5 问答 + 会话 ✅ 已完成（除断线续传）——**记忆在这里接线**
 
-- [ ] 新表 `chat_sessions` / `chat_messages`（问题、答案、引用的 chunk_id 列表、token 用量、created_at）
-      **必须落库**：进程内的记忆窗口在多 worker/重启下不存在，手机端还要求"关掉了再打开还在"
-- [ ] `aichatrouter.py` 修三处再实现：**`prefix` 只写 `/aichat`**（版本前缀只在 `main.py` 出现一次，
-      现在实测叠成了 `/api/v1/api/v1/aichat/...`）、在 `main.py` 里 `include_router`、非流式接口套 `ApiResponse`
-- [ ] **过渡期就把 8 条 `pass` 改成 `raise NotImplementedFeatureError(...)`**。
-      空函数返回 `None` → FastAPI 回 `200 + null`，前端按"成功"处理然后解包炸；
-      501 才是"接口存在但没实现"的正确表达，前端能显示"该功能未上线"
+- [x] ~~新表~~ ✅ `chat_sessions`（title / summary / **summary_seq 水位线** / 计数 / last_message_at）+
+      `chat_messages`（role / content / seq / token_count / sources JSON），`uq(session_id, seq)` 防并发重复；
+      `kb_id` 用 `ON DELETE SET NULL`（删库不该带走历史对话）
+- [x] ~~会话服务层~~ ✅ `app/rag/chat.py`：`new_chat/get_chat/list_chats/rename_chat/delete_chat/read_history`
+      + `load_context()`（历史从库读、摘要从 `summary` 读、长期记忆语义检索）+ `record_turn()`
+      （两条消息入库 → 按水位线折叠摘要 → 落长期记忆）。**每个查询都带 user_id**，别人的 session_id 一律 None
+- [x] ~~对话路由接线~~ ✅ 8 条全部实现并 include：会话 4 条 + 历史消息 + 问答（SSE/JSON 两条车道）+ 停止 + agent 目录。非流式一律 `ApiResponse[T]`，流式按 §3.6 不套外层
+- [x] ~~重复折叠防护~~ ✅ `summary_seq` 水位线 + `test_水位线之后不重复折叠` 钉住
+- [x] ~~上面那三处 + 下面那条 501~~ ✅ 一并做完：`prefix="/aichat"`（上一轮已修）、`include_router` 已加、返回体统一。防呆测试升级成「8 条路径必须出现在 `/api/v1/aichat` 下且正好 8 个操作」
+- [x] ~~过渡期的 501 占位~~ 随实现消失。留下的教训写进了 §12：占位函数返回 `None` 会让前端解包 `null` 时炸，以后新增接口要么 `raise NotImplementedFeatureError`，要么别挂上路由
 - [x] ~~SSE 协议层~~ ✅ 已实现 `app/rag/output/sse.py`：`meta/token/references/done/error` 五类帧、
       `id:` 序号、心跳注释帧、错误帧不外泄异常原文、`sse_response()` 带 `X-Accel-Buffering: no`。
       顺带修掉原实现两个静默 bug：`HumanMessage(**m)` 把 assistant 历史变成"用户说的话"；
@@ -145,14 +152,14 @@ WebView 路线有两个做法，差别不是"要不要 WebView"，而是**那几
 - [x] ~~结构化输出~~ ✅ `struct_response.py`：`AgentAnswer{answer,sources[],answerable,kb_id}` +
       `SourceRef`（带 chunk_id/document_id，能点回原文）；`ErrorResponse` 那种"让模型产出错误对象"
       的写法废掉 —— 模型不知道自己什么时候失败，错误由服务端产生
-- [ ] **SSE 接线**：对话路由里 `sse_response(stream_chat_tokens(model=..., messages=ctx.to_messages(), references=...))`
-- [ ] **断线续传**：`Last-Event-ID` → 按 `message_id` 找回半截答案继续播（依赖会话落库，别提前做）
-- [ ] 问答主流程：`retriever` 取 top-k → `context.prepare_chat()`（自动带短期窗口 + 长期记忆）→ 渲染 prompt → 调模型 → `context.commit_turn()` 写回两层记忆
-- [ ] **流式用 SSE**（`text/event-stream`，前端 `fetch` + `ReadableStream`，不上 WebSocket），并支持
-      `Last-Event-ID` 续传 —— 手机切后台/锁屏必然打断流，没有续传就会出现"答到一半永久卡住"
-- [ ] 答案必须带可点回原文的引用（chunk_id → `document_id` → `/documents/detail|download`）
-- [ ] 失败可见：检索为空 / 模型不可用 → 明确 `msg`，禁止静默兜底成胡说（`llm.py` 已保证不抛穿，接口层要显式区分"降级"和"成功"）
-- 验收：多轮对话有上下文、老对话被压进摘要、答案有来源、无资料时回答"不知道"
+- [x] ~~SSE 接线~~ ✅ `POST /aichat/conversations/{id}/chat` → `sse_response(answer.stream_turn(...))`；`meta` 帧带 `session_id/model/retrieval/generation_id`，`references` 在 `done` 之前发。`stream=false` 走同一条链路返回 JSON（脚本与 CI 冒烟用）
+- [ ] **断线续传**（M5 唯一剩下的）：`Last-Event-ID` → 会话已落库，所以能先判断"这轮到底答完没有"：答完了直接让前端读 `/messages` 补齐；没答完再考虑重放生成。别一上来就做"接着播 token"
+- [ ] `/stop` 的进程内局限（多 worker 不共享）→ 与 P1 的多 worker 部署一起解决，见 §12
+- [x] ~~问答主流程~~ ✅ `retrieval.retrieve()` 取资料 → `chat.load_context()`（水位线之后的窗口 + 长期记忆语义检索）→ `ctx.to_messages()` → 模型 → `chat.record_turn()`（**先落库再折叠**，按配置回写长期记忆）。编排集中在 `app/rag/answer.py`，两条车道共用同一个 `build_turn()`，不会出现"流式和非流式行为不一样"
+- [x] ~~流式用 SSE~~ ✅ `text/event-stream` + `X-Accel-Buffering: no` + 心跳注释帧（`CHAT_STREAM_HEARTBEAT_SECONDS`）。续传见下一条；**停止生成已经能用**：`/stop` 置标志位 → 流正常发 `done` → 半截答案照常落库（不是 `Task.cancel()`）
+- [x] ~~引用可点回原文~~ ✅ `sources[{index,document_id,chunk_id,kb_id,chunk_seq,page,heading,title,score,snippet}]`，随消息一起存进 `chat_messages.sources`，前端拿 `document_id` 直接跳 `/documents/detail|download`
+- [x] ~~失败可见~~ ✅ 模型没配置/构造失败 → 推流**前** 503；模型中途挂 → `error` 帧 + `trace_id`（异常原文只进日志）；检索为空 → `meta.retrieval.mode` 如实给 `none/no_scope/disabled/keyword`；prompt 里的 GUARDRAIL 要求"资料里没有就说不知道"
+- 验收：✅ 多轮有上下文（`load_context` 从库里读）、老对话被水位线压进摘要、答案有来源、无资料时不编造。真模型跑通要等 `.env` 填 key（测试用假模型）
 
 ### M6 慢任务与状态（0.5 天，与 M2 后半合并做也行）
 
@@ -274,19 +281,23 @@ WebView 路线有两个做法，差别不是"要不要 WebView"，而是**那几
 已就位（`app/db/models.py` 是单一真源，建表走 `scripts/init_db.py`）：
 
 ```
-users / tokens / knowledge_bases / documents / chunks / kb_shares
-                         ← 6 张；文档类数据全链路冗余 owner_id；授权表只挂 (kb_id, grantee_id)
+users / tokens / knowledge_bases / documents / chunks / kb_shares / chat_sessions / chat_messages
+                         ← 8 张；文档与会话数据全链路冗余 owner_id/user_id，鉴权过滤不靠 join
 ```
+
+> 加表之后记得：`scripts/init_db.py --snapshot > init_db.sql` 已同步（本轮已刷）；
+> `/health` 会直接告诉你哪张表还没建 —— 这条防呆当场逼我更新了测试里的期望表清单，有效。
 
 还缺（按新目标的优先级排序）：
 
 ```
-chat_sessions / chat_messages   会话与消息（含引用的 chunk_id 列表、token 用量）—— P0-M5，
-                                手机端的"关掉再打开还在"和多 worker 共享都依赖它，别再往后推
-password_reset_tokens           忘记密码 —— P1，但一旦给同事用就是硬需求
-chunks.embedding vector(N)      P0-M3，按要求暂缓（维度定了不能改）
-（长期记忆向量数据在 langchain 的 langchain_pg_collection/langchain_pg_embedding 里，
-  与上面 6 张业务表**故意不同库不同表**，不要试图 join）
+password_reset_tokens       忘记密码验证码/重置链接 —— P1，但一旦给同事用就是硬需求
+chunks.embedding vector(N)  仍未加。当前向量存在 PGVector 自己的两张表里，靠 metadata 的
+                            chunk_id 对应回来；要不要在业务表上开这列，取决于 embedding
+                            模型/维度拍板 —— 维度一旦建列就不能改（TODO.md M3）
+（文档向量与记忆向量分别落在 collection `kb_documents` 与 `long_term_memory`，
+  同一套 langchain_pg_collection/langchain_pg_embedding 表；**故意不和业务表 join**，
+  也正因为如此，任何"重建"只能按 metadata 精确删，绝不能 drop_tables()）
 ```
 
 ---
@@ -294,20 +305,22 @@ chunks.embedding vector(N)      P0-M3，按要求暂缓（维度定了不能改�
 ## 8. 建议执行顺序
 
 ```
-提交本轮改动（输出层 + 启动/健康检查）→ M-环境(打通 PG) → M0(知识库 5 条) → 防呆 lint 测试
-   → M2 后半(切块入库+status) → M7 前端(① -④页)
-   → M4(全文检索兜底) → M5(问答+SSE+会话落库+记忆接线) → 前端⑤对话页
-   → M8(工具调用 agent 化) → M9(HTTPS+刷新token+Capacitor APK 上机) → P1 安全/工程化收尾
+M-环境(打通 PG + 建 8 张表) → M0(知识库 5 条) ✅后端主线到这里就通了
+   → M7 前端(① -④页：登录/库/文档/详情)
+   → 前端⑤对话页(后端 /aichat 已就绪，只剩前端 + 断线续传)
+   → M8(工具调用 agent 化 + agent 列) → M-向量(M3 定 embedding → M4 换向量车道 → index_documents 验收)
+   → M9(HTTPS + refresh token + Capacitor APK 上机) → P1 安全/工程化收尾
 ```
 
 为什么是这个顺序：
 1. **打通 PG 排第一**是这次的新增判断 —— 手机化要求真并发、真扩展、真连接串，越晚切它，返工越多。
 2. **M0 必须先于任何前端页面**：拿不到 `kb_id`，前端所有页面都是空壳。
-3. **M2 后半必须先于问答**：`chunks` 空表时，agent 无凭据可检索，问答就只是"模型自由发挥"。
-4. **M4 先用全文兜底，不等 M3**：手机 agent 要的是"今天能问出带来源的答案"，语义检索是质量优化，不是前置。
+3. ~~M2 后半必须先于问答、对话路由接线、M4 全文兜底~~ ✅ **三件都通了**：`chunks` 有数据、`/aichat` 8 条已接入、检索有关键词车道。现在**唯一的硬阻塞是 M0**（建库接口），它挡住 upload 与 chat 的 `kb_id` 来源。
+4. **M4 先用关键词兜底，不等 M3** ✅ 已按这条做完：手机 agent 要的是"今天能问出带来源的答案"，语义检索是质量优化不是前置。换向量时只动 `retrieval.py` 内部，越权那几条测试一行都不许改。
 5. **前端不等后端全好**：M0 做完就能动前端 ①-④ 页，第 5 页（对话）等 M5。
-6. **记忆和输出协议都做完了**（`prepare_chat`/`commit_turn` + `sse_response`/`stream_chat_tokens`），
-   M5 的实现基本就是把它们串起来 —— 剩下的真工作量在**会话落库**和**检索**上。
+6. **M5 已经收工**（记忆、输出协议、会话落库、检索、流式、停止全接上了）。
+   所以前端 ⑤ 对话页不再需要等后端 —— 唯一的例外是**断线续传**（`Last-Event-ID`），
+   它是"手机切后台"场景下唯一还没解的对话问题，排在 M7 之后、M9 之前做。
 7. **防呆测试排在 M0 之后**：双前缀、裸 `None` 返回这两类坑都是"写出来不报错、上线才发现"的，
    靠 review 拦不住，而成本只有十几行断言。
 8. **`/health` 探库排在第一次部署之前**：否则"库没建/连不上"会被读成"服务正常"，

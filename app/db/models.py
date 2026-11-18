@@ -117,6 +117,7 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     tokens: Mapped[list["Token"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    chat_sessions: Mapped[list["ChatSession"]] = relationship(back_populates="user")
     knowledge_bases: Mapped[list["KnowledgeBase"]] = relationship(
         back_populates="owner", cascade="all, delete-orphan"
     )
@@ -281,6 +282,99 @@ class Chunk(Base):
     )
 
     document: Mapped["Document"] = relationship(back_populates="chunks")
+
+
+class ChatRole(StrEnum):
+    """chat_messages.role
+
+    和 app/rag/memory/base.ChatRole 取值一致，但 **db 层不 import rag**
+    （依赖方向只能自上而下：rag → services → db），所以这里独立定义一份。
+    """
+
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+    TOOL = "tool"
+
+
+class ChatSession(Base, TimestampMixin):
+    """一次对话的头部信息（会话列表、标题、压缩后的早期摘要）
+
+    为什么必须落库而不是放进程内存 —— 三条都是手机端/上线后会真遇到的：
+      1. "关掉 App 再打开还在"是基本要求，进程内窗口重启即丢；
+      2. 多 worker 部署时每个进程各存一份，同一个会话会"看运气"；
+      3. 长期记忆要按 conversation_id 关联回来，会话不存下来就没法关联。
+
+    summary 存的是**早期对话被压缩后的摘要**（不是最后一条消息）：
+    读历史 = summary + 最近若干轮；窗口长度由配置决定，超出就把最老的轮次并进 summary。
+    """
+
+    __tablename__ = "chat_sessions"
+    __table_args__ = (
+        Index("ix_chat_session_user_last", "user_id", "last_message_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID_TYPE, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID_TYPE, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    # 问答范围。删库时会话要留着，所以是 SET NULL 而不是 CASCADE
+    kb_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID_TYPE, ForeignKey("knowledge_bases.id", ondelete="SET NULL"), nullable=True
+    )
+    title: Mapped[str] = mapped_column(
+        String(255), default="新对话", server_default=text("'新对话'"), nullable=False
+    )
+    summary: Mapped[str] = mapped_column(Text, default="", server_default=text("''"), nullable=False)
+    # 摘要水位线：seq <= summary_seq 的消息**已经折进 summary 了**，
+    # 下次压缩必须从这条线之后开始，否则同一段对话会被反复折叠、摘要越滚越长。
+    summary_seq: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    message_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    token_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped["User"] = relationship(back_populates="chat_sessions")
+    knowledge_base: Mapped["KnowledgeBase | None"] = relationship()
+    # passive_deletes=True：删会话时不先把消息全查出来，直接靠外键级联
+    messages: Mapped[list["ChatMessage"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan", passive_deletes=True,
+        order_by="ChatMessage.seq",
+    )
+
+
+class ChatMessage(Base):
+    """一条消息。seq 是会话内序号（从 1 起），分页、续播、判重都靠它"""
+
+    __tablename__ = "chat_messages"
+    __table_args__ = (
+        # 会话内序号唯一：并发写同一条 seq 直接撞库，而不是悄悄多出两条重复消息
+        UniqueConstraint("session_id", "seq", name="uq_chat_message_session_seq"),
+        Index("ix_chat_message_session_created", "session_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID_TYPE, primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID_TYPE, ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    # 冗余 owner：鉴权过滤只认它，和 documents/chunks 一个口径（不靠 join 会话表）
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID_TYPE, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    role: Mapped[str] = mapped_column(
+        String(16), default=ChatRole.USER, server_default=text("'user'"), nullable=False
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    token_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 答案引用的原文位置：[{document_id, chunk_id, score, page, heading}]，前端点来源用
+    sources: Mapped[list] = mapped_column(
+        JSON_TYPE, default=list, server_default=text("'[]'"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"), nullable=False
+    )
+
+    session: Mapped["ChatSession"] = relationship(back_populates="messages")
 
 
 class KbShare(Base, TimestampMixin):

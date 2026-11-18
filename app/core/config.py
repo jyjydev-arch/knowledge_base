@@ -96,6 +96,15 @@ class Settings(BaseSettings):
     MEMORY_AUTO_WRITE: bool = True         # 每轮问答后是否自动落长期记忆
     MEMORY_EXTRACT_FACTS: bool = True      # True=用 LLM 抽「用户事实」再写；False=写一轮对话的摘要
     MEMORY_PG_COLLECTION: str = "long_term_memory"
+    # 知识库文档向量的 collection（与记忆分开，见 app/rag/memory/save.py 的说明）
+    DOCUMENT_VECTOR_COLLECTION: str = "kb_documents"
+    VECTOR_INDEX_BATCH_SIZE: int = 64
+
+    # ---------------- 文档索引（M2 后半）----------------
+    # 上传成功后是否立刻丢给 BackgroundTasks 解析切块。
+    # 测试车道设 False：那里的全局引擎是没建表的内存库，任务跑了只会制造噪声；
+    # 切块入库本身用 process_document(session=...) 直接测。
+    DOCUMENT_INDEX_ON_UPLOAD: bool = True
 
     # ---------------- 短期记忆（单个会话内的上下文窗口）----------------
     SHORT_TERM_ENABLED: bool = True
@@ -106,6 +115,19 @@ class Settings(BaseSettings):
     SHORT_TERM_MAX_SESSIONS: int = 512          # 进程内最多缓存多少个会话，超出按 LRU 淘汰
     SHORT_TERM_PERSIST: bool = False            # True 时把窗口落 data/memory/sessions/，重启不丢
     SHORT_TERM_USE_TIKTOKEN: bool = False       # 默认用字符启发式：tiktoken 首次要联网下载词表
+
+    # ---------------- 对话（M5：/aichat 会话与问答）----------------
+    # 检索总开关。关掉之后问答仍然能跑（只是没有【参考资料】），
+    # 前端联调时可以拿它对比「模型凭记忆答」和「凭资料答」的差别。
+    CHAT_RETRIEVAL_ENABLED: bool = True
+    CHAT_RETRIEVAL_TOP_K: int = 4          # 进 prompt 的资料块数（比 MEMORY_TOP_K 大一点：文档片段更碎）
+    CHAT_RETRIEVAL_MAX_CHARS: int = 4000   # 资料总长上限，超了从后往前丢，防止一个长块吃掉整个窗口
+    CHAT_SNIPPET_CHARS: int = 320          # 单块进 prompt 的截断长度（引用列表里也是这个）
+    CHAT_STREAM_HEARTBEAT_SECONDS: float = 15.0  # 0=不发心跳；反代/手机的空闲超时一般 30~60s
+    CHAT_AUTO_TITLE_CHARS: int = 30        # 首轮用问题自动命名时截取多少个字符
+    # 僵尸生成：上一路流要是被硬杀且没走到 finally，这一路会一直占着"该会话正在生成"的键。
+    # 超过这个秒数就允许被新请求顶掉（同时把旧的取消掉），而不是永远 409。
+    CHAT_STALE_GENERATION_SECONDS: int = 600
 
     # ---------------- 启动检查 / 健康检查 ----------------
     # 表不齐就不让进程起来（生产/Docker 建议 True）。默认 False：不改现有行为，

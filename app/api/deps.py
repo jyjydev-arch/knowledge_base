@@ -1,5 +1,7 @@
 """路由层公共依赖：数据库 Session、当前登录用户"""
 
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from typing import Annotated, Literal
 
 from fastapi import Depends, Request
@@ -10,7 +12,7 @@ from app.core.exceptions import ForbiddenError, NotFoundError, ParamError, Unaut
 from app.core.security import decode_access_token
 from app.db.crud import kb_crud, token_crud, user_crud
 from app.db.models import User
-from app.db.psql_config import get_db
+from app.db.psql_config import AsyncSessionLocal, get_db
 from app.services.kb_access import KbAccess, resolve
 
 # auto_error=False: 没带 Authorization 时由我们自己返回统一的 {"status":401,...}
@@ -46,6 +48,16 @@ async def get_current_user(
         raise UnauthorizedError("登录已失效（已登出或被踢下线），请重新登录")
 
     return user
+
+
+def get_session_factory():
+    """返回"还能再开一个 Session"的工厂，给流式接口收尾落库用
+
+    SSE 的生成器活得比请求函数久：请求级 Session（get_db）可能已经随依赖栈退出被还回连接池，
+    而且让一条数据库连接陪跑几十秒的模型流是在白占池子。所以流式车道要的是工厂不是 Session。
+    测试用 dependency_overrides 把它换成临时库的 sessionmaker（见 tests/conftest.py）。
+    """
+    return AsyncSessionLocal
 
 
 async def get_current_token(
@@ -133,4 +145,5 @@ KBManager = Annotated[KbAccess, Depends(require_kb_access("manage"))]
 CurrentUser = Annotated[User, Depends(get_current_user)]
 AdminUser = Annotated[User, Depends(require_admin_dep)]
 CurrentToken = Annotated[str, Depends(get_current_token)]
+SessionFactory = Annotated[Callable[[], AbstractAsyncContextManager[AsyncSession]], Depends(get_session_factory)]
 OptionalUser = Annotated[User | None, Depends(get_optional_user)]

@@ -14,7 +14,10 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from app.core import startup
 from app.core.config import settings
 
-TABLES = {"chunks", "documents", "kb_shares", "knowledge_bases", "tokens", "users"}
+TABLES = {
+    "chat_messages", "chat_sessions", "chunks", "documents", "kb_shares",
+    "knowledge_bases", "tokens", "users",
+}  # 和 app/db/models.py 里的 __tablename__ 保持一致，加表就要同步这里
 
 
 def fresh_engine(tmp_path, name="probe.db"):
@@ -226,9 +229,25 @@ def test_注册出来的路径没有双前缀():
     assert bad == []
 
 
-def test_aichatrouter_仍未接入_别悄悄上线():
-    """接线时要同时改这条：prefix 已修好，但处理函数还是 pass 占位"""
+def test_aichat对话路由已接入且前缀正确():
+    """接线完成（M5）：8 条都在 /api/v1/aichat 下面，一条不多一条不少
+
+    这条测试是双前缀事故的延续：include 时忘了传 prefix 会全 404，
+    prefix 写在 router 里又会叠成 /api/v1/api/v1/aichat，两种都要在这里挡住。
+    """
     from app.main import app
 
     paths = set(app.openapi()["paths"])
-    assert not any("/aichat" in path for path in paths)
+    expected = {
+        "/api/v1/aichat/conversations",
+        "/api/v1/aichat/conversations/{conversation_id}",
+        "/api/v1/aichat/conversations/{conversation_id}/messages",
+        "/api/v1/aichat/conversations/{conversation_id}/chat",
+        "/api/v1/aichat/conversations/{conversation_id}/stop",
+        "/api/v1/aichat/agents",
+    }
+    chat_paths = {path for path in paths if "/aichat" in path}
+    assert chat_paths == expected
+    # 6 个路径 8 个操作（conversations 有 POST/GET，conversation_id 有 PUT/DELETE）
+    operations = sum(len(app.openapi()["paths"][path]) for path in expected)
+    assert operations == 8, operations

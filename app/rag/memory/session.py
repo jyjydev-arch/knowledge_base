@@ -13,7 +13,9 @@
      只按 conversation_id 索引，一旦有人猜到/拿到别人的 id，就能接着别人的话头问 —— 越权。
   2. 摘要不是"有 LLM 才压缩"。没有 key、调用失败也必须能压（规则式兜底），
      否则窗口会无限长，等于没做短期记忆。
-  3. 进程内缓存 + 可选落盘。默认只在内存里（重启丢窗口是可以接受的，会话表以后进 DB），
+  3. **本类的存储是进程内**（可选落盘文件），只适合开发和无库场景；
+     线上走 app/rag/chat.py + chat_sessions/chat_messages 表。压缩算法两边共用
+     compress_window()，不会出现"同样聊十轮、两个车道压出两个结果"。
      SHORT_TERM_PERSIST=True 才写 data/memory/sessions/，方便前端联调时不用一直重登重聊。
 """
 
@@ -130,6 +132,71 @@ def model_compress(previous_summary: str, dropped: Sequence[ChatMessage], max_ch
 SUMMARY_RULE = "你是对话压缩器，把历史对话合并成简短要点摘要，保留目标、结论和未解决的问题。"
 
 
+@dataclass(slots=True)
+class WindowPolicy:
+    """窗口策略参数（轮数上限 / token 预算 / 摘要长度）
+
+    抽出来是因为**两处存储要用同一个算法**：
+      - 进程内车道：ShortTermMemory（开发、无库场景）
+      - 数据库车道：app/rag/chat.py（会话落库，手机端和重启后还在）
+    算法写两遍迟早变成"同样聊十轮，两边压缩结果不一样"，那才是真难查。
+    """
+
+    max_turns: int
+    token_budget: int
+    summary_max_chars: int
+
+    @classmethod
+    def from_settings(cls) -> WindowPolicy:
+        return cls(
+            max_turns=settings.SHORT_TERM_MAX_TURNS,
+            token_budget=settings.SHORT_TERM_TOKEN_BUDGET,
+            summary_max_chars=settings.SHORT_TERM_SUMMARY_MAX_CHARS,
+        )
+
+    @property
+    def max_messages(self) -> int:
+        return max(2, self.max_turns * 2)
+
+
+def compress_window(
+    messages: Sequence[ChatMessage],
+    summary: str,
+    policy: WindowPolicy,
+    summarizer: Summarizer,
+) -> tuple[list[ChatMessage], str, int]:
+    """纯函数：把超预算的最老整轮并进摘要，返回 (保留的消息, 新摘要, 压缩掉的轮数)
+
+    不修改入参。保留至少一轮（窗口压空是 bug：模型会失去当前问题的语境）。
+    迭代上限是防"token 预算比一轮本身还小"时死循环 —— 那种配置真存在过。
+    """
+    kept = list(messages)
+    new_summary = summary or ""
+    compressed = 0
+    guard = 0
+    while guard < 200:
+        guard += 1
+        tokens = sum(message.tokens for message in kept) + estimate_tokens(new_summary)
+        over = len(kept) > policy.max_messages or tokens > policy.token_budget
+        if not over or len(kept) <= 2:
+            break
+        pair = kept[:2]
+        del kept[:2]
+        compressed += 1
+        new_summary = summarizer(new_summary, pair, policy.summary_max_chars)
+    return kept, new_summary, compressed
+
+
+def auto_summarizer(previous_summary: str, dropped: Sequence[ChatMessage], max_chars: int) -> str:
+    """配了真 key 就用模型压缩，否则规则版 —— 两条路都必须返回可用文本
+
+    放在模块级而不是类的静态方法里，是因为 DB 车道（app/rag/chat.py）也要用同一个选择逻辑。
+    """
+    if settings.llm_ready:
+        return model_compress(previous_summary, dropped, max_chars)
+    return rule_compress(previous_summary, dropped, max_chars)
+
+
 class ShortTermMemory:
     """进程内会话窗口缓存（可选落盘）
 
@@ -165,10 +232,7 @@ class ShortTermMemory:
     # ---------- 配置与后端选择 ----------
     @staticmethod
     def _auto_summarizer(previous_summary: str, dropped: Sequence[ChatMessage], max_chars: int) -> str:
-        """配了真 key 就用模型压缩，否则规则版 —— 两条路都必须返回可用的文本"""
-        if settings.llm_ready:
-            return model_compress(previous_summary, dropped, max_chars)
-        return rule_compress(previous_summary, dropped, max_chars)
+        return auto_summarizer(previous_summary, dropped, max_chars)
 
     @property
     def enabled(self) -> bool:
@@ -291,24 +355,23 @@ class ShortTermMemory:
             self._compress(state)
             self._touch(state)
 
-    # ---------- 压缩 ----------
-    def _over_limit(self, state: SessionState) -> bool:
-        if self.max_turns and len(state.messages) > self.max_turns * 2:
-            return True
-        return bool(self.token_budget and state.window_tokens > self.token_budget)
+    @property
+    def policy(self) -> WindowPolicy:
+        return WindowPolicy(
+            max_turns=self.max_turns,
+            token_budget=self.token_budget,
+            summary_max_chars=self.summary_max_chars,
+        )
 
     def _compress(self, state: SessionState) -> None:
-        """把最老的整轮挪出窗口、并进 summary
-
-        保留至少一轮：窗口压到空是 bug，模型会失去当前问题的语境（用户会觉得"它把我上一句忘了"）。
-        """
-        guard = 0
-        while self._over_limit(state) and len(state.messages) > 2 and guard < 50:
-            guard += 1
-            pair = state.messages[:2]
-            del state.messages[:2]
-            state.compressed_turns += 1
-            state.summary = self._summarizer(state.summary, pair, self.summary_max_chars)
+        """调纯函数 compress_window，再把结果写回状态（算法与 DB 车道同一份）"""
+        kept, new_summary, compressed = compress_window(
+            state.messages, state.summary, self.policy, self._summarizer
+        )
+        if compressed:
+            state.messages = kept
+            state.summary = new_summary
+            state.compressed_turns += compressed
 
     # ---------- 读 ----------
     def window(self, conversation_id: str, user_id: str) -> list[ChatMessage]:

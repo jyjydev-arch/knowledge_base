@@ -11,6 +11,9 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 os.environ.setdefault("SECRET_KEY", "test-secret-key")
 os.environ.setdefault("ADMIN_USERNAMES", "admin")
 os.environ.setdefault("SQL_ECHO", "False")
+# 上传接口默认会丢一个后台解析任务，而测试里全局引擎是**没建表的内存库**：
+# 任务跑了只会制造 "no such table" 噪声。索引逻辑用 process_document(session=...) 直接测。
+os.environ.setdefault("DOCUMENT_INDEX_ON_UPLOAD", "False")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -18,6 +21,7 @@ from sqlalchemy import event  # noqa: E402
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
 from sqlalchemy.pool import NullPool  # noqa: E402
 
+from app.api.deps import get_session_factory
 from app.db import models  # noqa: F401,E402  建表前必须导入，否则表不在 metadata 里
 from app.db.base import Base  # noqa: E402
 from app.db.psql_config import get_db  # noqa: E402
@@ -94,6 +98,9 @@ def client(engine):
                 raise
 
     app.dependency_overrides[get_db] = override_get_db
+    # 流式车道收尾落库用的是「自己再开一个 Session」（app/api/deps.get_session_factory）。
+    # 不覆盖它，SSE 测试就会去连那个没建表的内存库：报错信息还特别像业务 bug。
+    app.dependency_overrides[get_session_factory] = lambda: maker
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()

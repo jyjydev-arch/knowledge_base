@@ -676,7 +676,9 @@ dependencies = [
     { name = "langchain" },
     { name = "langchain-openai" },
     { name = "langchain-postgres" },
+    { name = "langchain-text-splitters" },
     { name = "passlib" },
+    { name = "pgvector" },
     { name = "pydantic-settings" },
     { name = "pyjwt" },
     { name = "pypdf" },
@@ -704,7 +706,9 @@ requires-dist = [
     { name = "langchain", specifier = ">=1.4.9" },
     { name = "langchain-openai", specifier = ">=1.7.4" },
     { name = "langchain-postgres", specifier = ">=0.0.19" },
+    { name = "langchain-text-splitters", specifier = ">=1.1.3" },
     { name = "passlib", specifier = ">=1.7.4" },
+    { name = "pgvector", specifier = ">=0.3.6" },
     { name = "pydantic-settings", specifier = ">=2.16.2" },
     { name = "pyjwt", specifier = ">=2.15.1" },
     { name = "pypdf", specifier = ">=5.1.0" },
@@ -802,6 +806,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/be/db/7f9195371c824e706231365b4c6c85573b12c4375286e7471d6a488e8091/langchain_protocol-0.0.21.tar.gz", hash = "sha256:04b3e80852233a8db39b39d3ad2438d892531dc0ecd41459e857a139ee0e601c", size = 6344, upload-time = "2026-11-05T16:16:47.078Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3f/f6/25232abfce5cc696c21f7947e6ae11cc6b124e5099783408ff8552c545a3/langchain_protocol-0.0.21-py3-none-any.whl", hash = "sha256:7f42f9eae7c08bb9d74850057da50b5483970a3df91b7a8a5aadec6a3dfa4d12", size = 7418, upload-time = "2026-11-05T16:16:45.444Z" },
+]
+
+[[package]]
+name = "langchain-text-splitters"
+version = "1.1.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "langchain-core" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/85/22/d401fffe8d3f1339f6ac880e5d637db73933efa95635304849b2d44ab0fe/langchain_text_splitters-1.1.3.tar.gz", hash = "sha256:929b6c76f99d611a5b1d8f5591ef302909b86a436ceb3217034d24e4757868d8", size = 308295, upload-time = "2026-10-02T15:46:33.173Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c7/51/2880d2e88cce13c1180178f7e8dc796c2f45b2dc09cc09ed407d116c08cc/langchain_text_splitters-1.1.3-py3-none-any.whl", hash = "sha256:50edeb318b3be6a6308dddd7d616ab82823a9ccbea59a9c14c58a7b91df60295", size = 38217, upload-time = "2026-10-02T15:46:32.271Z" },
 ]
 
 [[package]]

@@ -148,6 +148,35 @@ class ChatContext:
         }
 
 
+def build_context(
+    user_id: str,
+    conversation_id: str,
+    question: str,
+    *,
+    documents_text: str = "",
+    long_term: list[MemoryItem] | None = None,
+    summary: str = "",
+    history: list[ChatMessage] | None = None,
+    system_prompt: str = GUARDRAIL_PROMPT,
+) -> ChatContext:
+    """纯拼装：材料给全，直接产出 ChatContext
+
+    prepare_chat() 是"自己去取材料"（进程内短期窗口），这个函数是"材料你带来"。
+    会话落库的车道（app/rag/chat.py）用它：历史从 chat_messages 读、摘要从 chat_sessions.summary 读，
+    两条车道拼出来的 prompt 结构完全一样，不会出现"换车道行为变了"。
+    """
+    return ChatContext(
+        user_id=str(user_id),
+        conversation_id=str(conversation_id),
+        question=question,
+        documents_text=documents_text or "",
+        long_term=list(long_term or []),
+        summary=summary or "",
+        history=list(history or []),
+        system_prompt=system_prompt,
+    )
+
+
 def prepare_chat(
     user_id: str,
     conversation_id: str,

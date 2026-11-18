@@ -28,6 +28,14 @@ api（路由/依赖）  →  schemas（入参出参）  →  services（业务�
 - **路由（`app/api/v1/*`）要薄**：只做「取参 → 调 crud/service → 组装 `ApiResponse`」。单函数超过 ~40 行、或含算法（切块、检索、prompt 拼装），抽到 `app/services/xxx.py`。
 - **CRUD（`app/db/crud/*`）不抛 HTTP 异常**：查不到返回 `None`，唯一索引冲突 `except IntegrityError: await db.rollback(); return None`，由路由决定提示语。
 - **service 层不碰 Session 之外的东西**：纯函数优先（chunker、prompt、解析器），方便单测。
+- **切块/向量归 `app/services/`，不要放回 `app/rag/`**：
+  `chunker.py`（纯函数切块）、`vector_index.py`（chunks → pgvector）、`text_metrics.py`（token 估算）
+  都是业务算法层，和 `parsers/` 同层；`app/rag/` 只放**模型侧**（llm、memory、output、chat 服务编排）。
+  文档向量与用户记忆向量是两回事： collection 必须分开（`DOCUMENT_VECTOR_COLLECTION` vs
+  `MEMORY_PG_COLLECTION`），混在一个 collection 里检索会互相命中、按文档清理向量会连带删掉记忆。
+- **算法一处、存储两处**：短期窗口的压缩算法只有 `memory/session.py:compress_window()` 一份，
+  进程内车道（`ShortTermMemory`）和数据库车道（`app/rag/chat.py` + `chat_sessions`）都调它。
+  两边各写一遍的结局是"同样聊十轮，两个车道压出两个结果"，那种 bug 复现极难。
 - **格式解析一律放 `app/services/parsers/`**，不要放 `app/utils/`：
   解析器带明确业务语义（产出 ParsedBlock 给切块用、字段要落进 chunks.page/heading/extra），
   属于「业务算法层」。`app/utils/` 只留无业务含义的通用小工具（文本归一化、时间处理这类），
@@ -35,11 +43,21 @@ api（路由/依赖）  →  schemas（入参出参）  →  services（业务�
   新增一种格式只需两步：① 在 `parsers/` 写一个 `parse(path) -> ParsedDocument`；
   ② 在 `parsers/registry.py` 的 `PARSERS` / `MIME_BY_EXT` 各加一行 ——
   上传白名单 `documentrouter.ALLOWED_EXTENSIONS` 直接取注册表，不用改第三处（有测试锁这条一致性）。
+- 向量的 metadata **必带 `user_id / kb_id / document_id / chunk_id`**（见 `vector_index.chunk_metadata`）：
+  缺这几项检索层就无法按用户过滤，而越权是这类系统最常见的洞；向量 id 直接用 `chunks.id`，
+  不要随机生成，否则两份数据迟早对不上账。任何"重建"都只按 `document_id` 精确删，
+  **不许用 `PGVector.drop_tables()`**（它 drop 的是整两张 langchain 表，会连带删掉长期记忆）。
 - `app/api/deps.py` 只放依赖注入（DB/鉴权/权限），路由文件里不重复写鉴权逻辑。
 - **大模型侧在 `app/rag/`**，不放 `app/services/`，也不让路由直连 langchain：
   `app/rag/llm.py` 是**唯一**出网口（模型名/端点/key 只从 settings 读，缺 key 时降级而不是抛穿）；
   `app/rag/memory/` 是两层记忆。路由只调 `context.aprepare_chat / acommit_turn`，
   不要在路由里自己拼 prompt 字符串——拼装顺序就是安全边界（见 §6）。
+- **`app/rag/` 内部也有分工，别堆回一个文件**：`chat.py`=会话**存取**（查/插/窗口/摘要水位线），
+  `answer.py`=一轮问答的**编排**（范围→检索→上下文→模型→落库，流式与一次性共用它），
+  `retrieval.py`=**检索**（召回与算分，返回形状与向量版一致），`generation.py`=在跑生成的**进程内注册表**（/stop）。
+  路由只调 `build_turn` + `stream_turn`/`answer_turn`，不碰 langchain、不拼 prompt。
+- **检索必须带范围**：`retrieval.retrieve()` 的 `kb_ids` 由调用方给（会话的库或 `kb_access.accessible_kb_ids()`），
+  空范围返回空结果而不是"全库"。任何新增检索车道都要把这条写进测试 —— 越权是这类系统最常见的洞。
 - 包内**不放 `__init__.py`**（PEP 420 命名空间包），导入一律写全路径：`from app.db.crud import user_crud`。
 
 ## 3. 接口规范
@@ -121,7 +139,10 @@ data: {"status":200,"msg":"chunk","data":{"text":"你好"}}
 - 路由侧：`response_class=StreamingResponse`、`response_model=None`，响应一律用
   `sse_response(...)` 生成 —— 它已经把 `X-Accel-Buffering: no` 等头设好，漏了这头 nginx 会把
   整段答案攒完才发（手机端表现是长时间空白后一次性蹦出来）。
-- `id:` 是给断线续传预留的（手机切后台必然打断流）；真正的续传要等 M5 会话落库。
+- `id:` 是断线续传的钩子。会话已落库（M5），所以前端重连时可以拿 `Last-Event-ID` + `/messages` 的 `seq`判断这一轮到底有没有答完，而不是让用户看到一条永远停在半截的气泡。
+- **错误分两段**：推流之前的失败（会话不存在、模型没配置、该会话已有回答在生成）走正常 HTTP 状态码，所以准备阶段 `answer.build_turn()` 必须在返回 `StreamingResponse` **之前**跑完；推流之后只能 200 + `error` 帧。
+- **流式里不许用请求级 Session**：生成器活得比请求函数久，而且让一条数据库连接陪跑几十秒的模型流是白占池子。收尾落库统一用 `deps.get_session_factory` 新开的 Session（测试在 conftest 里覆盖它）。
+- `stream_chat_tokens(..., on_text=, should_stop=)` 这两个钩子服务 `/stop` 与落库：停止 = 置标志位后**正常收尾发 done**（半截答案要能落库），不是 `asyncio.Task.cancel()`。
 - 结构化输出与逐字流式**互斥**，别同时用，见 `app/rag/output/struct_response.py`。
 
 ### 3.7 新增接口 checklist
@@ -294,10 +315,13 @@ data: {"status":200,"msg":"chunk","data":{"text":"你好"}}
 | --- | --- | --- |
 | `userrouter.py` | `POST /update·/delete·/reset_password` 非 REST | 历史遗留，保留兼容；新模块用 REST（`/documents` 已在用 `DELETE`） |
 | `documentrouter.py` | `GET /detail`、`GET /status` 用 query 参数、`DELETE /delete/{id}` 路径重复动词 | M1 实现时收敛成 `GET /documents/{id}`、`DELETE /documents/{id}` |
-| `documentrouter.py` | 6 条路由全部实现 | 下一步做 M0 知识库 CRUD，否则前端拿不到 `kb_id` |
+| `documentrouter.py`、`aichatrouter.py` | 文档 6 条、对话 8 条全部实现 | 仍卡在做 M0 知识库 CRUD：没有 HTTP 途径能建库，`upload` 与 `chat` 的 `kb_id` 都无来源 |
 | `app/services/process_document.py` | 路径唯一来源 `document_storage_path()`；落盘/删除/列目录都带 `kb_id`，同步 IO 一律由路由 `run_in_threadpool` 调 | M2 的解析/切块也放这里，别在路由里写文件操作 |
 | `app/services/kb_access.py` | 权限矩阵与越权语义的唯一实现处 | 新增资源（会话、导出、批量操作）先接它，别自己判 owner_id |
-| `app/services/process_document.py` | 删除逻辑已实现并被路由调用；解析/切块还是空的 | M2 的落点 |
+| `app/services/process_document.py` | 解析→切块→入库的编排在 `process_document()`，由 `/upload` 的后台任务调用（`DOCUMENT_INDEX_ON_UPLOAD` 可关） | 失败重跑入口还没有：M2 补 `POST /documents/reindex/{id}`，并处理重启时停在 parsing/chunking 的文档 |
 | `main.py` | 无日志、无请求 ID、无 429 限流 | P1 工程化补齐 |
+| `app/rag/generation.py` | `/stop` 靠进程内注册表，多 worker 之间不共享（键按 user+会话，超时会自愈顶掉僵尸键） | M9 换 Redis 广播或按会话做粘性连接；现在别把它当分布式能力 |
+| `app/rag/retrieval.py` | 只有关键词车道（LIKE 召回 + 词频算分 + 每篇文档限流），不是语义检索 | 定了 embedding 厂商与维度后加向量车道；返回形状不变，路由和前端不用改 |
+| `app/api/v1/aichatrouter.py` | 会话表没有 agent 列，`/agents` 是配置常量，前端选了也不落库 | M8 给 `chat_sessions` 加 `agent` 列并把 `build_agent()` 接进 `answer.py` |
 | `chunks.embedding` | 还没有向量列（按要求先不做 pgvector） | M3 再加列 + HNSW 索引，并回填 `knowledge_bases.embedding_model/embedding_dim` |
-| 已修复（别当坑抄） | `tokens` 存 JWT 原文 → 改 sha256；`get_optional_user` 漏校验吊销 token；`/user/info?user_id=` 越权面；`init_db.sql` 与 ORM 漂移 | — |
+| 已修复（别当坑抄） | `aichatrouter.py` 的 8 个 `pass` 占位（实测返回 `200 + null`，前端解包必炸）→ 已实现并 include；`/agents` 一开始漏了鉴权 → 已补 `CurrentUser`；`tokens` 存 JWT 原文 → 改 sha256；`get_optional_user` 漏校验吊销 token；`/user/info?user_id=` 越权面；`init_db.sql` 与 ORM 漂移 | — |

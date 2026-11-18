@@ -28,6 +28,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
+from app.services.text_metrics import estimate_tokens as _estimate_tokens
+
 
 class ChatRole(StrEnum):
     """会话消息的角色。只有这三种会进短期记忆窗口
@@ -46,7 +48,6 @@ class ChatRole(StrEnum):
 MEMORY_TYPES = ("conversation", "summary", "fact", "preference", "note")
 
 _SEGMENT_RE = re.compile(r"[^A-Za-z0-9_.\-]")
-_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
 
 
 class MemoryError(Exception):
@@ -87,17 +88,12 @@ def safe_segment(value: Any, name: str = "user_id") -> str:
 
 
 def estimate_tokens(text: str) -> int:
-    """粗略估算 token 数，用于短期记忆的预算控制
+    """Token 粗估：实现只有一份，在 app/services/text_metrics.py
 
-    为什么不直接用 tiktoken：首次调用要联网下载词表，离线/CI 会卡。
-    估算口径：中日韩字符 ≈ 1 token/字，其余 ≈ 4 字符/1 token。
-    真要精确计数就把 SHORT_TERM_USE_TIKTOKEN 设 True（模型词表下载过才有效）。
+    切块（chunker）、短期窗口预算（session）、prompt 估算（context）都要这个数，
+    两处实现迟早漂成"同一个文本两个长度"。这里保留同名函数只是为了不打破既有导入。
     """
-    if not text:
-        return 0
-    cjk = len(_CJK_RE.findall(text))
-    other = len(text) - cjk
-    return cjk + max(1, other // 4) if other else cjk
+    return _estimate_tokens(text)
 
 
 @dataclass(slots=True)

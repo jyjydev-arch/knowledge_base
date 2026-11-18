@@ -15,7 +15,8 @@ from fastapi import APIRouter, BackgroundTasks, File, Path, Query, UploadFile
 from fastapi.responses import FileResponse
 from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import DB, KBReader, KBWriter, CurrentUser
+from app.api.deps import DB, CurrentUser, KBReader, KBWriter
+from app.core.config import settings
 from app.core.document_hash import calculate_document_hash
 from app.core.exceptions import (
     BusinessError,
@@ -25,9 +26,9 @@ from app.core.exceptions import (
     ParamError,
 )
 from app.db.crud import document_crud
-from app.services import kb_access
 from app.schemas.common import ApiResponse, PageData, PageParams
 from app.schemas.document_schemas import DocumentDetail, DocumentResponse, DocumentStatusOut
+from app.services import kb_access
 from app.services.parsers.registry import MIME_BY_EXT
 from app.services.process_document import (
     SAFE_EXT,
@@ -36,6 +37,7 @@ from app.services.process_document import (
     kb_storage_dirs,
     missing_file_paths,
     new_document_file_path,
+    process_document,
     remove_kb_directories_if_empty,
     search_document_files,
 )
@@ -202,8 +204,9 @@ async def upload_document(
         6. 写库：create_document 内部级联处理知识库统计与 version+1（需求「更新知识库的版本信息」）；
         7. 任一步失败都回滚已落盘的文件，不留垃圾；返回体给前端 DocumentResponse（含 id/status/download_url）。
 
-    background_tasks 目前没用上：M2 解析/切块接进来后，这里会
-    background_tasks.add_task(process_document, document.id) 让上传接口先返回再慢慢解析。
+    解析/切块不在这里同步做（一篇 PDF 全文解析几秒起步，前端不该干等）：
+    写库成功后丢给 background_tasks，接口立刻返回 status=pending，
+    前端轮询 GET /documents/status 看它变成 indexed / failed。
     """
     # 1. 类型边界
     original_name = _safe_basename(file.filename)
@@ -258,6 +261,10 @@ async def upload_document(
     if document is None:  # 外键失败 / 并发下撞了唯一索引
         await _cleanup_uploaded_file(kb.owner_id, current_user.id, kb.id, document_id, ext)
         raise ConflictError("文档入库失败，请重试")
+
+    # 8. 异步解析入库。任务里自己开 Session —— 请求级的那个在这一步之后就被归还了。
+    if settings.DOCUMENT_INDEX_ON_UPLOAD:
+        background_tasks.add_task(process_document, str(document.id))
 
     return ApiResponse.ok(DocumentResponse.model_validate(document), msg="上传成功")
 
